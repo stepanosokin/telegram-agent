@@ -34,15 +34,29 @@ export function telegramClient(profile, stopSignal) {
       const chat = await call('getChat', { chat_id: profile.chatId });
       return chat?.id === profile.chatId && chat.type === 'private';
     },
-    send(text) {
+    /** @param {{replyTo?: number, keyboard?: {text: string, callback_data: string}[][]}} [options] */
+    send(text, options = {}) {
       return call('sendMessage', {
         chat_id: profile.chatId,
         text,
         link_preview_options: { is_disabled: true },
+        reply_parameters: options.replyTo === undefined ? undefined : { message_id: options.replyTo },
+        reply_markup: options.keyboard === undefined ? undefined : { inline_keyboard: options.keyboard },
+      });
+    },
+    answerCallback(id, text) {
+      return call('answerCallbackQuery', { callback_query_id: id, text });
+    },
+    completeChoice(messageId, text) {
+      return call('editMessageText', {
+        chat_id: profile.chatId,
+        message_id: messageId,
+        text,
+        reply_markup: { inline_keyboard: [] },
       });
     },
     updates(offset) {
-      return call('getUpdates', { offset, timeout: 25, allowed_updates: ['message'] }, 35_000);
+      return call('getUpdates', { offset, timeout: 25, allowed_updates: ['message', 'callback_query'] }, 35_000);
     },
   };
 }
@@ -50,7 +64,24 @@ export function telegramClient(profile, stopSignal) {
 export function isOwnerMessage(message, profile) {
   return message?.from?.id === profile.ownerId
     && message.from.is_bot === false
-    && message.chat?.id === profile.chatId
+    && isPrivateMessage(message, profile);
+}
+
+export function isOwnerCallback(query, profile) {
+  return typeof query?.id === 'string'
+    && query.id.length > 0
+    && typeof query.data === 'string'
+    && query.from?.id === profile.ownerId
+    && query.from.is_bot === false
+    && isPrivateMessage(query.message, profile)
+    && query.message.from?.id === profile.botId
+    && query.message.from.is_bot === true
+    && Number.isSafeInteger(query.message.date)
+    && query.message.date > 0;
+}
+
+function isPrivateMessage(message, profile) {
+  return message?.chat?.id === profile.chatId
     && message.chat.type === 'private'
     && Number.isSafeInteger(message.message_id)
     && message.message_id > 0;

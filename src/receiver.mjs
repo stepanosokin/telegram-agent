@@ -1,13 +1,26 @@
+import { randomUUID } from 'node:crypto';
 import { openAppServer } from './codex.mjs';
 import { readProfile } from './profile.mjs';
-import { isOwnerMessage, telegramClient, TelegramError } from './telegram.mjs';
+import { isOwnerCallback, isOwnerMessage, telegramClient, TelegramError } from './telegram.mjs';
 
 const unavailable = 'Ответ не доставлен. Проверьте исходную сессию Codex на компьютере.';
 const unknown = 'Codex не подтвердил результат. Проверьте историю и очередь сессии на компьютере перед повтором.';
 const delivered = 'Codex принял ваш ответ.';
+const deliveryStatuses = { unavailable, unknown, delivered };
 
 function isLiveThread(thread, threadId) {
   return thread?.id === threadId && ['idle', 'active'].includes(thread.status?.type);
+}
+
+function sessionSuffix(threadId, threadIds) {
+  const suffix = threadId.slice(-8);
+  return [...threadIds].some((id) => id !== threadId && id.endsWith(suffix)) ? threadId : `…${suffix}`;
+}
+
+function sessionLabel(session, maxNameLength) {
+  const name = session.name.replace(/\s+/g, ' ').trim();
+  const displayName = [...name].slice(0, maxNameLength).join('') || 'Без названия';
+  return `Codex · ${session.suffix} · ${displayName}`;
 }
 
 // Telegram accepts up to 4096 characters. Keep each part independently replyable.
@@ -25,6 +38,7 @@ function* withHeader(header, text) {
 async function runReceiver(telegram, profile, threadIds, stopSignal) {
   const sessions = new Map();
   const messageBindings = new Map();
+  const drafts = new Map();
   let outgoing = Promise.resolve();
   const codex = openAppServer((method, event) => {
     const session = sessions.get(event?.threadId);
@@ -40,9 +54,10 @@ async function runReceiver(telegram, profile, threadIds, stopSignal) {
       return;
     }
     outgoing = outgoing.then(async () => {
-      if (!(await session.ready) || sessions.get(event.threadId) !== session || !event.item.text.trim()) return;
-      const name = session.name.replace(/\s+/g, ' ').trim().slice(0, 160) || event.threadId;
-      const header = `Codex · ${name}\n\n`;
+      if (!(await session.ready) || sessions.get(event.threadId) !== session) return;
+      session.confirmed = true;
+      if (!event.item.text.trim()) return;
+      const header = `${sessionLabel(session, 160)}\n\n`;
       for (const text of withHeader(header, event.item.text)) {
         const published = await telegram.send(text);
         if (Number.isSafeInteger(published?.message_id) && published.message_id > 0) {
@@ -52,16 +67,95 @@ async function runReceiver(telegram, profile, threadIds, stopSignal) {
     }).catch(() => console.error('Не удалось опубликовать сообщение Codex в Telegram.'));
   });
 
+  async function deliver(session, text) {
+    if (!session?.confirmed || sessions.get(session.threadId) !== session) return 'unconfirmed';
+    let thread;
+    try {
+      if (await codex.isLoaded(session.threadId)) thread = await codex.read(session.threadId);
+    } catch {
+      // Connection failed before there was an attempt to submit this text.
+    }
+    if (!isLiveThread(thread, session.threadId) || stopSignal.aborted || sessions.get(session.threadId) !== session) {
+      return 'unconfirmed';
+    }
+    return codex.deliver(thread, text);
+  }
+
+  async function askForSession(message, staleReply = false, unavailableSession = undefined) {
+    const choices = new Map([...sessions.values()]
+      .filter((session) => session.confirmed && session !== unavailableSession)
+      .map((session) => [randomUUID(), session]));
+    const keyboard = [...choices].map(([callback_data, session]) => [{ text: sessionLabel(session, 40), callback_data }]);
+    const instructions = 'Выберите сессию для этого текста.';
+    const text = choices.size ? (staleReply ? `${unavailable}\n${instructions}` : instructions) : unavailable;
+    const prompt = await telegram.send(text, {
+      replyTo: message.message_id,
+      keyboard: choices.size ? keyboard : undefined,
+    }).catch(() => console.error('Telegram не подтвердил отправку выбора сессии.'));
+    if (choices.size && Number.isSafeInteger(prompt?.message_id) && prompt.message_id > 0) {
+      drafts.set(prompt.message_id, {
+        sourceId: message.message_id,
+        text: message.text,
+        choices,
+        result: undefined,
+      });
+    }
+  }
+
+  async function chooseSession(query) {
+    if (!isOwnerCallback(query, profile)) return;
+    const promptId = query.message.message_id;
+    const draft = drafts.get(promptId);
+    const session = draft?.choices.get(query.data);
+    const original = query.message.reply_to_message;
+    const answer = (text) => telegram.answerCallback(query.id, text).catch(() => {});
+    if (!session) {
+      await answer('Этот выбор недоступен. Отправьте текст заново.');
+      return;
+    }
+    // Telegram can omit the source reply after the delivery has already finished.
+    if (draft.result) {
+      await answer(draft.result === 'delivered' ? 'Текст уже принят сессией.' : unknown);
+      return;
+    }
+    if (!isOwnerMessage(original, profile) || original.message_id !== draft.sourceId || original.text !== draft.text) {
+      await answer('Исходный текст недоступен или изменился. Отправьте его заново.');
+      return;
+    }
+    await answer('Проверяю сессию…');
+    const result = await deliver(session, draft.text);
+    if (result === 'delivered' || result === 'unknown') {
+      draft.result = result;
+      draft.text = undefined;
+      await telegram.completeChoice(promptId, `${sessionLabel(session, 160)}\n\n${deliveryStatuses[result]}`)
+        .catch(() => sendStatus(result));
+    } else {
+      await sendStatus('unavailable');
+    }
+  }
+
+  function sendStatus(result) {
+    return telegram.send(deliveryStatuses[result]).catch(() => {
+      console.error('Telegram не подтвердил отправку статуса ответа.');
+    });
+  }
+
   try {
     await codex.initialize();
     for (const threadId of threadIds) {
       if (!await codex.isLoaded(threadId)) continue;
       const thread = await codex.read(threadId);
       if (!isLiveThread(thread, threadId)) continue;
-      const session = { threadId, name: typeof thread.name === 'string' ? thread.name : '', ready: null };
+      const session = {
+        threadId,
+        name: typeof thread.name === 'string' ? thread.name : '',
+        suffix: sessionSuffix(threadId, threadIds),
+        ready: null,
+        confirmed: false,
+      };
       sessions.set(threadId, session);
       // Resume can hydrate history if the thread was unloaded after the check.
-      // Inbound replies require a binding to a new item event on this connection.
+      // A new item event provides live evidence for replies and explicit selection.
       session.ready = codex.subscribe(threadId).then((resumed) => isLiveThread(resumed, threadId), () => false);
       if (!await session.ready) sessions.delete(threadId);
     }
@@ -79,28 +173,24 @@ async function runReceiver(telegram, profile, threadIds, stopSignal) {
         if (stopSignal.aborted) return 0;
         if (!Number.isSafeInteger(update?.update_id) || update.update_id < 0 || update.update_id < offset) continue;
         offset = update.update_id + 1;
+        if (update.callback_query) {
+          await chooseSession(update.callback_query);
+          continue;
+        }
         const message = update.message;
         if (!isOwnerMessage(message, profile) || typeof message.text !== 'string' || !message.text.trim()) continue;
         const reply = message.reply_to_message;
-        if (!reply) continue;
         await outgoing;
+        if (!reply) {
+          await askForSession(message);
+          continue;
+        }
         const session = reply.from?.id === profile.botId && reply.from.is_bot === true
           ? messageBindings.get(reply.message_id)
           : undefined;
-        let result = 'unavailable';
-        if (session && sessions.get(session.threadId) === session) {
-          let thread;
-          try {
-            if (await codex.isLoaded(session.threadId)) thread = await codex.read(session.threadId);
-          } catch {
-            // Connection failed before there was an attempt to submit this text.
-          }
-          if (isLiveThread(thread, session.threadId) && !stopSignal.aborted
-            && sessions.get(session.threadId) === session) result = await codex.deliver(thread, message.text);
-        }
-        await telegram.send({ unavailable, unknown, delivered }[result]).catch(() => {
-          console.error('Telegram не подтвердил отправку статуса ответа.');
-        });
+        const result = await deliver(session, message.text);
+        if (result === 'unconfirmed') await askForSession(message, true, session);
+        else await sendStatus(result);
       }
     }
     return 0;

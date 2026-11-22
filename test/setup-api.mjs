@@ -20,8 +20,9 @@ const sessions = scenario.sessions || {
   [threadIds[0]]: { name: 'Первый диалог', status: { type: 'idle' }, turns: [] },
 };
 let rpcCount = 0;
-let updatesDelivered = false;
+let polls = 0;
 let sentCount = 0;
+const prompts = [];
 
 function record(channel, method, params) {
   process.send({ channel, method, params });
@@ -49,13 +50,35 @@ globalThis.fetch = async (url, options) => {
         return new Response(JSON.stringify({ ok: false, error_code: 503 }), { status: 503 });
       }
       result = { message_id: ++sentCount, chat: telegram.chat };
+      if (params.reply_markup?.inline_keyboard.length) {
+        const original = scenario.updates.find(({ message }) => message?.message_id === params.reply_parameters.message_id);
+        prompts.push({
+          message: { ...result, date: 1, from: telegram.bot, reply_to_message: original?.message },
+          choices: params.reply_markup.inline_keyboard.flat(),
+        });
+      }
+      break;
+    case 'answerCallbackQuery':
+    case 'editMessageText':
+      result = true;
       break;
     case 'getUpdates':
-      if (updatesDelivered) {
+      if (++polls === 1) {
+        result = scenario.updates || [];
+      } else if (polls === 2 && scenario.callbacks) {
+        result = scenario.callbacks.map(({ prompt, choice, tokenFrom = prompt, messageOverrides, ...overrides }, index) => ({
+          update_id: 100 + index,
+          callback_query: {
+            id: `callback-${index}`,
+            from: { id: 300, is_bot: false },
+            message: { ...prompts[prompt]?.message, ...messageOverrides },
+            data: prompts[tokenFrom]?.choices[choice]?.callback_data,
+            ...overrides,
+          },
+        }));
+      } else {
         return new Response(JSON.stringify({ ok: false, error_code: 409 }), { status: 409 });
       }
-      updatesDelivered = true;
-      result = scenario.updates || [];
       break;
     default:
       throw new Error('Unexpected Telegram method');
@@ -141,7 +164,7 @@ childProcess.spawn = (command, args, options) => {
         throw new Error('Unexpected App Server method: ' + method);
     }
     emit({ id, result });
-    if (method === 'thread/resume' && session && !scenario.noNewItem) {
+    if (method === 'thread/resume' && session && !scenario.noNewItem && !scenario.withoutItem?.includes(threadId)) {
       const index = threadIds.indexOf(threadId) + 1;
       emit({
         method: 'item/completed',

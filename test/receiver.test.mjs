@@ -22,6 +22,10 @@ function reply(overrides = {}, id = 10) {
   return { update_id: id, message: { ...baseMessage, ...overrides } };
 }
 
+function newText(text, messageId = 30, updateId = 10) {
+  return reply({ text, message_id: messageId, reply_to_message: undefined }, updateId);
+}
+
 async function run(scenario, threads = [primaryThread]) {
   const home = await mkdtemp(join(tmpdir(), 'telegram-agent-test-'));
   const profile = join(home, '.telegram');
@@ -111,11 +115,150 @@ test('сохраняет адресата ответа при нескольки
     updates: [reply()],
   }, [primaryThread, otherThread]);
   const texts = callsFor(result, 'telegram', 'sendMessage').map(({ params }) => params.text);
-  assert.deepEqual(texts, ['Codex · Один\n\nОтвет 1', 'Codex · Два\n\nОтвет 2', 'Codex принял ваш ответ.']);
+  assert.deepEqual(texts, [
+    'Codex · …00000001 · Один\n\nОтвет 1', 'Codex · …00000002 · Два\n\nОтвет 2', 'Codex принял ваш ответ.',
+  ]);
   assert.deepEqual(
     callsFor(result, 'codex', 'thread/queue/add').map(({ params }) => params.threadId),
     [primaryThread],
   );
+});
+
+test('показывает различимый выбор сессии и не отправляет текст до нажатия', async () => {
+  const result = await run({
+    sessions: {
+      [primaryThread]: { name: 'Общее название', status: { type: 'idle' } },
+      [otherThread]: { name: 'Общее название', status: { type: 'idle' } },
+    },
+    updates: [newText('Сообщение с выбором адресата')],
+  }, [primaryThread, otherThread]);
+  const prompt = callsFor(result, 'telegram', 'sendMessage')
+    .find(({ params }) => params.reply_parameters?.message_id === 30);
+  assert.match(prompt?.params.text ?? '', /выберите сессию/i);
+  const labels = prompt.params.reply_markup.inline_keyboard.flat().map(({ text }) => text);
+  assert.equal(labels.length, 2);
+  assert.ok(labels.every((label) => /Codex.*Общее название/.test(label)));
+  assert.equal(new Set(labels).size, 2);
+  assert.equal(callsFor(result, 'codex', 'thread/queue/add').length, 0);
+  assert.equal(callsFor(result, 'codex', 'turn/steer').length, 0);
+});
+
+test('направляет отдельные тексты в разные сессии при выборе в обратном порядке', async () => {
+  const result = await run({
+    sessions: {
+      [primaryThread]: { name: 'Один', status: { type: 'idle' } },
+      [otherThread]: { name: 'Два', status: { type: 'idle' } },
+    },
+    updates: [newText('Первый текст'), newText('Второй текст', 31, 11), newText('Третий текст', 32, 12)],
+    callbacks: [
+      { prompt: 1, choice: 1 },
+      { prompt: 0, choice: 0 },
+      { prompt: 1, choice: 0, messageOverrides: { reply_to_message: null } },
+    ],
+  }, [primaryThread, otherThread]);
+  const queued = callsFor(result, 'codex', 'thread/queue/add');
+  assert.deepEqual(queued.map(({ params }) => [params.threadId, params.input[0].text]), [
+    [otherThread, 'Второй текст'], [primaryThread, 'Первый текст'],
+  ]);
+  const initialPoll = callsFor(result, 'telegram', 'getUpdates')[0];
+  assert.ok(initialPoll.params.allowed_updates.includes('callback_query'));
+  const statuses = callsFor(result, 'telegram', 'editMessageText').map(({ params }) => params);
+  assert.deepEqual(statuses.map(({ message_id, reply_markup }) => [message_id, reply_markup]), [
+    [4, { inline_keyboard: [] }], [3, { inline_keyboard: [] }],
+  ]);
+  assert.match(callsFor(result, 'telegram', 'answerCallbackQuery').at(-1)?.params.text ?? '', /уже принят/i);
+});
+
+test('сохраняет адресат старого ответа и предлагает выбор для неподтверждённой привязки', async () => {
+  const result = await run({
+    sessions: {
+      [primaryThread]: { name: 'Один', status: { type: 'idle' } },
+      [otherThread]: { name: 'Два', status: { type: 'idle' } },
+    },
+    updates: [
+      newText('Новый текст'),
+      reply({ message_id: 31, text: 'Ответ другому диалогу' }, 11),
+      reply({ message_id: 32, text: 'Ответ по старой привязке', reply_to_message: {
+        message_id: 99, from: { id: 100, is_bot: true },
+      } }, 12),
+    ],
+    callbacks: [{ prompt: 0, choice: 1 }, { prompt: 1, choice: 0 }],
+  }, [primaryThread, otherThread]);
+  const fallback = callsFor(result, 'telegram', 'sendMessage')
+    .find(({ params }) => params.reply_parameters?.message_id === 32);
+  assert.match(fallback?.params.text ?? '', /проверьте исходную сессию.*выберите сессию/is);
+  assert.deepEqual(callsFor(result, 'codex', 'thread/queue/add').map(({ params }) => [params.threadId, params.input[0].text]), [
+    [primaryThread, 'Ответ другому диалогу'], [otherThread, 'Новый текст'], [primaryThread, 'Ответ по старой привязке'],
+  ]);
+});
+
+test('отклоняет кнопку от неверного владельца, чата, текста или сообщения бота', async () => {
+  const result = await run({
+    updates: [newText('Первый текст'), newText('Второй текст', 31, 11)],
+    callbacks: [
+      { prompt: 0, choice: 0, from: { id: 301, is_bot: false } },
+      { prompt: 0, choice: 0, messageOverrides: { chat: { id: 201, type: 'private' } } },
+      { prompt: 0, choice: 0, messageOverrides: { chat: { id: 200, type: 'group' } } },
+      { prompt: 0, choice: 0, messageOverrides: { from: { id: 101, is_bot: true } } },
+      { prompt: 0, choice: 0, messageOverrides: { date: 0 } },
+      { prompt: 0, choice: 0, messageOverrides: { reply_to_message: { ...baseMessage, text: 'Изменённый текст' } } },
+      { prompt: 0, choice: 0, tokenFrom: 1 },
+      { prompt: 0, choice: 0 },
+    ],
+  });
+  const acknowledgements = callsFor(result, 'telegram', 'answerCallbackQuery');
+  assert.deepEqual(acknowledgements.map(({ params }) => params.callback_query_id), [
+    'callback-5', 'callback-6', 'callback-7',
+  ]);
+  assert.match(acknowledgements[0].params.text, /исходный текст недоступен или изменился/i);
+  assert.match(acknowledgements[1].params.text, /выбор недоступен/i);
+  assert.deepEqual(callsFor(result, 'codex', 'thread/queue/add').map(({ params }) => params.input[0].text), ['Первый текст']);
+});
+
+test('проверяет доступность выбранной сессии и позволяет выбрать другую после отказа', async () => {
+  const result = await run({
+    sessions: {
+      [primaryThread]: { name: 'Один', status: { type: 'idle' } },
+      [otherThread]: { name: 'Два', status: { type: 'idle' } },
+    },
+    loaded: [[primaryThread, otherThread], [primaryThread, otherThread], [primaryThread]],
+    updates: [newText('Первый текст')],
+    callbacks: [{ prompt: 0, choice: 1 }, { prompt: 0, choice: 0 }],
+  }, [primaryThread, otherThread]);
+  assert.match(callsFor(result, 'telegram', 'sendMessage').at(-1)?.params.text ?? '', /ответ не доставлен/i);
+  assert.deepEqual(callsFor(result, 'codex', 'thread/queue/add').map(({ params }) => params.threadId), [primaryThread]);
+});
+
+test('сохраняет различимый признак одноимённой сессии, если список сократился', async () => {
+  const result = await run({
+    sessions: {
+      [primaryThread]: { name: 'Общее название', status: { type: 'idle' } },
+      [otherThread]: { name: 'Общее название', status: { type: 'idle' } },
+    },
+    loaded: [[primaryThread, otherThread], [primaryThread, otherThread], [otherThread]],
+    updates: [newText('Первый текст'), reply({ message_id: 31 }, 11)],
+  }, [primaryThread, otherThread]);
+  const keyboards = callsFor(result, 'telegram', 'sendMessage')
+    .filter(({ params }) => params.reply_markup).map(({ params }) => params.reply_markup.inline_keyboard);
+  assert.equal(keyboards[0].length, 2);
+  assert.equal(keyboards[1].length, 1);
+  assert.equal(keyboards[1][0][0].text, keyboards[0][1][0].text);
+});
+
+test('показывает только подтверждённую живым событием сессию, когда другая могла открыться из истории', async () => {
+  const result = await run({
+    sessions: {
+      [primaryThread]: { name: 'Сохранённый диалог', status: { type: 'idle' } },
+      [otherThread]: { name: 'Подключённый диалог', status: { type: 'idle' } },
+    },
+    withoutItem: [primaryThread],
+    updates: [newText('Первый текст')],
+    callbacks: [{ prompt: 0, choice: 0 }],
+  }, [primaryThread, otherThread]);
+  const prompt = callsFor(result, 'telegram', 'sendMessage').find(({ params }) => params.reply_markup);
+  assert.equal(prompt.params.reply_markup.inline_keyboard.length, 1);
+  assert.match(prompt.params.reply_markup.inline_keyboard[0][0].text, /Подключённый диалог/);
+  assert.deepEqual(callsFor(result, 'codex', 'thread/queue/add').map(({ params }) => params.threadId), [otherThread]);
 });
 
 test('сверяет активный ход, открытый на общем сервере', async () => {
