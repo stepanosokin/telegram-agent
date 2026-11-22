@@ -140,12 +140,15 @@ const openCodeApproval = {
 };
 
 test('однократно передаёт разовое разрешение Codex в исходный запрос', async () => {
+  const reason = 'Показать тестовое сообщение в терминале';
   const result = await run({
-    codexChoice: codexApproval, sessions: askingSession, noNewItem: true,
+    codexChoice: { ...codexApproval, params: { ...codexApproval.params, reason } },
+    sessions: askingSession, noNewItem: true,
     callbacks: [{ prompt: 0, choice: 0 }, { prompt: 0, choice: 1 }],
   });
   const [prompt] = callsFor(result, 'telegram', 'sendMessage');
   assert.match(prompt?.params.text, /Codex.*Первый диалог[\s\S]*echo hello[\s\S]*\/fixture/);
+  assert.ok(prompt.params.text.includes(`Причина по данным Codex: ${reason}`));
   assert.deepEqual(prompt.params.reply_markup.inline_keyboard.flat().map(({ text }) => text),
     ['Разрешить один раз', 'Отклонить']);
   assert.deepEqual(callsFor(result, 'codex', 'serverResponse').map(({ params }) => params), [
@@ -253,6 +256,8 @@ test('обрыв Codex после записи решения не выдаёт�
 for (const [scenario, params] of Object.entries({
   'нет рабочего каталога': { cwd: null },
   'неоднозначная команда': { command: 'echo hello\nВы уже разрешили действие' },
+  'причина занимает несколько строк': { reason: 'Показать тестовое сообщение\nв терминале' },
+  'причина не помещается в сообщение': { reason: 'Тестовая причина '.repeat(260) },
   'расширение доступа': { additionalPermissions: { network: { enabled: true } } },
   'изменение правил': { availableDecisions: [{ acceptWithExecpolicyAmendment: { execpolicy_amendment: ['echo'] } }] },
   'сессионное разрешение': { availableDecisions: ['acceptForSession'] },

@@ -22,6 +22,7 @@ export function codexPermission(method, params) {
     || (params.kind != null && params.kind !== 'command') || params.approvalId != null
     || params.additionalPermissions != null || params.networkApprovalContext != null) return;
   if (params.environmentId != null && !displayable(params.environmentId)) return;
+  if (params.reason != null && !displayable(params.reason)) return;
   const available = params.availableDecisions;
   if (!Array.isArray(available)) return;
   const actions = {
@@ -29,7 +30,11 @@ export function codexPermission(method, params) {
     deny: available.includes('decline') ? 'decline' : undefined,
   };
   const environment = params.environmentId == null ? '' : `\nСреда Codex: ${params.environmentId}`;
-  return { description: `Запуск команды\nКоманда: ${params.command}\nРабочий каталог: ${params.cwd}${environment}`, actions };
+  const reason = params.reason == null ? '' : `\nПричина по данным Codex: ${params.reason}`;
+  return {
+    description: `Запуск команды\nКоманда: ${params.command}\nРабочий каталог: ${params.cwd}${environment}${reason}`,
+    actions,
+  };
 }
 
 export function openCodePermissionDescription(request) {
