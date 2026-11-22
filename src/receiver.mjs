@@ -5,12 +5,20 @@ import { codexChoices } from './codex-choices.mjs';
 import { openCodeForms } from './opencode-forms.mjs';
 import { codexPermission, openCodePermissionDescription, permissions } from './permissions.mjs';
 import { readProfile } from './profile.mjs';
+import { openTextState } from './text-state.mjs';
 import { isOwnerCallback, isOwnerMessage, telegramClient, TelegramError } from './telegram.mjs';
 
 function deliveryStatus(result, agent) {
   if (result === 'delivered') return `${agent} принял ваш ответ.`;
   if (result === 'unknown') return `${agent} не подтвердил результат. Проверьте историю и очередь сессии на компьютере перед повтором.`;
   return `Ответ не доставлен. Проверьте исходную сессию${agent ? ' ' + agent : ''} на компьютере.`;
+}
+
+function attemptStatus(result, agent) {
+  if (result === 'delivered' && !agent) return 'Текст уже принят сессией.';
+  if (result === 'unknown' && !agent) return 'Результат неизвестен. Проверьте историю и очередь сессии перед повтором.';
+  const status = deliveryStatus(result, agent);
+  return ['unavailable', 'received'].includes(result) ? `${status} Чтобы попробовать снова, отправьте текст новым сообщением.` : status;
 }
 
 function isLiveThread(thread, threadId) {
@@ -40,9 +48,8 @@ function* withHeader(header, text) {
   }
 }
 
-async function runReceiver(telegram, profile, threadIds, openCodeIds, stopSignal) {
+async function runReceiver(telegram, profile, textState, threadIds, openCodeIds, stopSignal) {
   const sessions = new Map();
-  const messageBindings = new Map();
   const drafts = new Map();
   const defaultAgent = !openCodeIds.size ? 'Codex' : !threadIds.size ? 'OpenCode' : undefined;
   let outgoing = Promise.resolve();
@@ -50,10 +57,10 @@ async function runReceiver(telegram, profile, threadIds, openCodeIds, stopSignal
   const forms = openCodeForms(telegram, (session) => sessionLabel(session, 160));
   const approvals = permissions(telegram, (session) => sessionLabel(session, 160), bindMessage);
 
-  function bindMessage(session, published) {
+  async function bindMessage(session, published) {
     if (sessions.get(session.key) === session && Number.isSafeInteger(published?.message_id) && published.message_id > 0) {
+      await textState.bind(published.message_id, session.key, session.serverInstance);
       session.confirmed = true;
-      messageBindings.set(published.message_id, session);
     }
   }
 
@@ -61,11 +68,13 @@ async function runReceiver(telegram, profile, threadIds, openCodeIds, stopSignal
     if (!body.trim()) return;
     const header = `${sessionLabel(session, 160)}\n\n`;
     for (const text of withHeader(header, body)) {
-      bindMessage(session, await telegram.send(text));
+      await bindMessage(session, await telegram.send(text));
     }
   }
 
-  const codex = threadIds.size ? openAppServer((method, event, requestId) => {
+  /** @type {ReturnType<typeof openAppServer> | undefined} */
+  let codex;
+  function onCodexEvent(method, event, requestId) {
     const key = `Codex:${event?.threadId}`;
     if (method === 'serverRequest/resolved') {
       void choices.resolve(event?.threadId, event?.requestId);
@@ -85,6 +94,7 @@ async function runReceiver(telegram, profile, threadIds, openCodeIds, stopSignal
       approvals.clear('Codex', session.id, { matches: (id) => id === event.turn?.id });
     }
     if (method === 'turn/started') {
+      if (typeof event.turn?.id === 'string') session.confirmed = true;
       choices.startTurn(session.id, event.turn?.id);
       approvals.clear('Codex', session.id, { matches: (id) => id !== event.turn?.id });
     }
@@ -115,10 +125,16 @@ async function runReceiver(telegram, profile, threadIds, openCodeIds, stopSignal
       session.confirmed = true;
       await publish(session, event.item.text);
     }).catch(() => console.error('Не удалось опубликовать сообщение Codex в Telegram.'));
-  }, () => {
+  }
+
+  function clearCodexSessions() {
+    codex = undefined;
     choices.clearThread(undefined);
     approvals.clear('Codex', undefined, { disconnected: true });
-  }) : undefined;
+    for (const [key, session] of sessions) {
+      if (session.agent === 'Codex') sessions.delete(key);
+    }
+  }
 
   async function confirmCodexTurn(session, turnId) {
     try {
@@ -132,12 +148,14 @@ async function runReceiver(telegram, profile, threadIds, openCodeIds, stopSignal
     }
   }
 
+  /** @type {Awaited<ReturnType<typeof import('./opencode.mjs').openOpenCode>>} */
   let openCode;
   let openCodeReady;
-  let openCodeConnected = true;
+  let openCodeGeneration;
   const openCodeRevisions = new Map();
   function clearOpenCodeSessions() {
-    openCodeConnected = false;
+    openCodeGeneration = undefined;
+    openCode = undefined;
     forms.close();
     approvals.clear('OpenCode', undefined, { disconnected: true });
     for (const [key, session] of sessions) {
@@ -176,17 +194,18 @@ async function runReceiver(telegram, profile, threadIds, openCodeIds, stopSignal
     if (!['session.text.ended', 'session.viewed', 'session.execution.started', 'form.created', 'permission.asked']
       .includes(event.type)) return;
     const revision = openCodeRevisions.get(key);
+    const connectionReady = openCodeReady;
     outgoing = outgoing.then(async () => {
-      const connection = await openCodeReady;
-      if (!connection) return;
+      const connection = await connectionReady;
+      if (!connection || openCode !== connection) return;
       if (event.type === 'session.execution.started') {
         const active = await connection.active().catch(() => undefined);
         if (active?.[id]?.type !== 'running') return;
       }
-      const session = await confirmOpenCodeSession(connection, id, revision, event.type === 'session.viewed');
+      const session = await confirmOpenCodeSession(connection, id, revision, { verifyReplyable: event.type === 'session.viewed' });
       if (session && event.type === 'form.created') {
         await forms.publish(session, event.data.form.id, connection, () =>
-          openCodeConnected && !stopSignal.aborted && sessions.get(key) === session);
+          openCode === connection && !stopSignal.aborted && sessions.get(key) === session);
       }
       if (session && event.type === 'permission.asked') {
         await publishOpenCodePermission(connection, session, event.data);
@@ -201,7 +220,7 @@ async function runReceiver(telegram, profile, threadIds, openCodeIds, stopSignal
     const requestId = request.id;
     if (typeof requestId !== 'string' || !requestId.startsWith('per')) return;
     const { id, key } = session;
-    const connected = () => openCodeConnected && !stopSignal.aborted && sessions.get(key) === session;
+    const connected = () => openCode === connection && !stopSignal.aborted && sessions.get(key) === session;
     // OpenCode 2.3.2 accepts a reused request ID and reply lacks an atomic comparison of the request.
     await approvals.publish({
       session, id: requestId, details: { description: openCodePermissionDescription(request) },
@@ -212,28 +231,32 @@ async function runReceiver(telegram, profile, threadIds, openCodeIds, stopSignal
     });
   }
 
-  async function confirmOpenCodeSession(connection, id, revision, verifyReplyable = false) {
+  async function confirmOpenCodeSession(connection, id, revision, { verifyReplyable = false, requireActive = false } = {}) {
     const key = `OpenCode:${id}`;
     // Viewing a dialog can load history without taking ownership of a running turn.
-    const read = verifyReplyable ? connection.readReplyableSession : connection.read;
-    const data = await read(id).catch(() => undefined);
-    if (!openCodeConnected || openCodeRevisions.get(key) !== revision) return;
+    const lookup = verifyReplyable ? connection.readReplyableSession(id, requireActive) : connection.read(id);
+    const data = await lookup.catch(() => undefined);
+    if (openCode !== connection || openCodeRevisions.get(key) !== revision) return;
     if (data?.id !== id || !data.time || data.time.archived !== undefined) {
       const session = sessions.get(key);
       if (verifyReplyable && session) session.confirmed = false;
       return;
     }
-    const session = sessions.get(key) ?? { agent: 'OpenCode', key, id, suffix: sessionSuffix(id, openCodeIds) };
+    const session = sessions.get(key) ?? {
+      agent: 'OpenCode', key, id, suffix: sessionSuffix(id, openCodeIds), serverInstance: connection.instance,
+    };
     session.name = typeof data.title === 'string' ? data.title : '';
     session.confirmed = true;
     sessions.set(key, session);
     return session;
   }
 
-  async function deliver(session, text) {
+  async function deliver(session, messageId, text) {
     if (!session?.confirmed || sessions.get(session.key) !== session) return 'unconfirmed';
+    const submit = (send) => textState.submit(messageId, session.agent, () =>
+      stopSignal.aborted || sessions.get(session.key) !== session ? 'unavailable' : send());
     if (session.agent === 'OpenCode') {
-      const result = await openCode.deliver(session.id, text);
+      const result = await openCode.deliver(session.id, text, submit);
       if (result === 'unconfirmed') session.confirmed = false;
       return result;
     }
@@ -246,7 +269,40 @@ async function runReceiver(telegram, profile, threadIds, openCodeIds, stopSignal
     if (!isLiveThread(thread, session.id) || stopSignal.aborted || sessions.get(session.key) !== session) {
       return 'unconfirmed';
     }
-    return codex.deliver(thread, text);
+    return codex.deliver(thread, text, submit);
+  }
+
+  async function restoreReply(reply) {
+    if (reply.from?.id !== profile.botId || reply.from.is_bot !== true
+      || !Number.isSafeInteger(reply.message_id) || reply.message_id <= 0) return;
+    const binding = await textState.binding(reply.message_id);
+    if (!binding) return;
+    if (binding.key.startsWith('Codex:')) {
+      const id = binding.key.slice('Codex:'.length);
+      if (!threadIds.has(id)) return;
+      try {
+        const connection = await connectCodex();
+        const session = sessions.get(binding.key) ?? await attachCodexSession(connection, id);
+        // Resume can load history itself, so only an independent live event qualifies.
+        await outgoing;
+        if (session?.confirmed) return session;
+      } catch {
+        // A disconnected server or stored history supplies no live routing evidence.
+      }
+      return;
+    }
+    const id = binding.key.slice('OpenCode:'.length);
+    if (!openCodeIds.has(id)) return;
+    const connection = await connectOpenCode();
+    await outgoing;
+    const known = sessions.get(binding.key);
+    if (known?.confirmed) return known;
+    if (connection) {
+      return confirmOpenCodeSession(connection, id, openCodeRevisions.get(binding.key), {
+        verifyReplyable: true,
+        requireActive: binding.serverInstance !== connection.instance,
+      });
+    }
   }
 
   async function askForSession(message, staleReply = false, unavailableSession = undefined) {
@@ -278,12 +334,15 @@ async function runReceiver(telegram, profile, threadIds, openCodeIds, stopSignal
     const original = query.message.reply_to_message;
     const answer = (text) => telegram.answerCallback(query.id, text).catch(() => {});
     if (!session) {
-      await answer('Этот выбор недоступен. Отправьте текст заново.');
+      const previous = !draft && isOwnerMessage(original, profile) && await textState.attempt(original.message_id);
+      const text = previous ? attemptStatus(previous.result, previous.agent)
+        : 'Этот выбор недоступен. Если уже отправляли текст в сессию, проверьте её историю и очередь перед повтором.';
+      await answer(text);
       return;
     }
     // Telegram can omit the source reply after the delivery has already finished.
     if (draft.result) {
-      await answer(draft.result === 'delivered' ? 'Текст уже принят сессией.' : deliveryStatus('unknown', session.agent));
+      await answer(draft.result === 'delivered' ? 'Текст уже принят сессией.' : attemptStatus(draft.result, session.agent));
       return;
     }
     if (!isOwnerMessage(original, profile) || original.message_id !== draft.sourceId || original.text !== draft.text) {
@@ -291,11 +350,11 @@ async function runReceiver(telegram, profile, threadIds, openCodeIds, stopSignal
       return;
     }
     await answer('Проверяю сессию…');
-    const result = await deliver(session, draft.text);
-    if (result === 'delivered' || result === 'unknown') {
+    const result = await deliver(session, draft.sourceId, draft.text);
+    if (result !== 'unconfirmed') {
       draft.result = result;
       draft.text = undefined;
-      await telegram.editChoice(promptId, `${sessionLabel(session, 160)}\n\n${deliveryStatus(result, session.agent)}`)
+      await telegram.editChoice(promptId, `${sessionLabel(session, 160)}\n\n${attemptStatus(result, session.agent)}`)
         .catch(() => sendStatus(result, session.agent));
     } else {
       await sendStatus('unavailable', session.agent);
@@ -303,72 +362,108 @@ async function runReceiver(telegram, profile, threadIds, openCodeIds, stopSignal
   }
 
   function sendStatus(result, agent) {
-    return telegram.send(deliveryStatus(result, agent)).catch(() => {
+    return telegram.send(attemptStatus(result, agent)).catch(() => {
       console.error('Telegram не подтвердил отправку статуса ответа.');
     });
   }
 
   async function connectCodex() {
-    if (!codex) return;
-    await codex.initialize();
-    for (const threadId of threadIds) {
-      if (!await codex.isLoaded(threadId)) continue;
-      const thread = await codex.read(threadId);
-      if (!isLiveThread(thread, threadId)) continue;
-      const session = {
-        agent: 'Codex',
-        key: `Codex:${threadId}`,
-        id: threadId,
-        name: typeof thread.name === 'string' ? thread.name : '',
-        suffix: sessionSuffix(threadId, threadIds),
-        ready: null,
-        confirmed: false,
-      };
-      sessions.set(session.key, session);
-      // Resume can hydrate history if the thread was unloaded after the check.
-      // A new item event provides live evidence for replies and explicit selection.
-      session.ready = codex.subscribe(threadId).then((resumed) => isLiveThread(resumed, threadId), () => false);
-      if (!await session.ready) sessions.delete(session.key);
+    if (codex) return codex;
+    if (!threadIds.size || stopSignal.aborted) return;
+    const connection = openAppServer(onCodexEvent, clearCodexSessions);
+    codex = connection;
+    try {
+      await connection.initialize();
+      return connection;
+    } catch (error) {
+      connection.close();
+      throw error;
     }
   }
 
+  async function attachCodexSession(connection, threadId) {
+    if (!connection || !await connection.isLoaded(threadId)) return;
+    const thread = await connection.read(threadId);
+    if (!isLiveThread(thread, threadId) || codex !== connection) return;
+    const session = {
+      agent: 'Codex', key: `Codex:${threadId}`, id: threadId,
+      name: typeof thread.name === 'string' ? thread.name : '',
+      suffix: sessionSuffix(threadId, threadIds), ready: null, confirmed: false,
+    };
+    sessions.set(session.key, session);
+    // Resume can hydrate history if the thread was unloaded after the check.
+    // A new item event provides live evidence for explicit selection.
+    session.ready = connection.subscribe(threadId).then((resumed) => isLiveThread(resumed, threadId), () => false);
+    if (await session.ready && sessions.get(session.key) === session) return session;
+    if (sessions.get(session.key) === session) sessions.delete(session.key);
+  }
+
+  async function connectOpenCode() {
+    if (!openCodeIds.size || stopSignal.aborted) return;
+    const previous = openCode;
+    if (previous && await previous.currentServer().catch(() => false)) return previous;
+    await previous?.close();
+    const generation = Symbol();
+    openCodeGeneration = generation;
+    const current = () => openCodeGeneration === generation;
+    openCodeReady = import('./opencode.mjs')
+      .then(({ openOpenCode }) => openOpenCode(
+        (event) => { if (current()) onOpenCodeEvent(event); },
+        () => { if (current()) clearOpenCodeSessions(); },
+        stopSignal,
+      ))
+      .then((connection) => {
+        if (current()) openCode = connection;
+        return connection;
+      })
+      .catch(() => undefined);
+    return openCodeReady;
+  }
+
   try {
-    if (openCodeIds.size) {
-      openCodeReady = import('./opencode.mjs')
-        .then(({ openOpenCode }) => openOpenCode(onOpenCodeEvent, clearOpenCodeSessions, stopSignal))
-        .catch(() => undefined);
+    const sessionKeys = new Set([
+      ...[...threadIds].map((id) => `Codex:${id}`),
+      ...[...openCodeIds].map((id) => `OpenCode:${id}`),
+    ]);
+    const mayRestore = await textState.hasBinding(sessionKeys);
+    const openCodeStarting = connectOpenCode();
+    const codexReady = (async () => {
+      const connection = await connectCodex();
+      for (const threadId of threadIds) await attachCodexSession(connection, threadId);
+    })();
+    if (openCodeIds.size || mayRestore) {
+      await codexReady.catch(() => {});
+    } else {
+      await codexReady;
     }
-    const codexReady = connectCodex();
-    if (openCodeIds.size) await codexReady.catch(() => {});
-    else await codexReady;
-    openCode = await openCodeReady;
-    const active = await openCode?.active().catch(() => undefined);
+    const openCodeStartingConnection = await openCodeStarting;
+    const active = await openCodeStartingConnection?.active().catch(() => undefined);
     for (const id of openCodeIds) {
       if (active?.[id]?.type === 'running') {
-        await confirmOpenCodeSession(openCode, id, openCodeRevisions.get(`OpenCode:${id}`));
+        await confirmOpenCodeSession(openCodeStartingConnection, id, openCodeRevisions.get(`OpenCode:${id}`));
       }
       const key = `OpenCode:${id}`;
       const revision = openCodeRevisions.get(key);
-      const pending = await openCode?.pendingForms(id).catch(() => undefined);
-      const pendingApprovals = await openCode?.pendingPermissions(id).catch(() => undefined);
+      const pending = await openCodeStartingConnection?.pendingForms(id).catch(() => undefined);
+      const pendingApprovals = await openCodeStartingConnection?.pendingPermissions(id).catch(() => undefined);
       if (!pending?.length && !pendingApprovals?.length) continue;
-      const session = await confirmOpenCodeSession(openCode, id, revision);
+      const session = await confirmOpenCodeSession(openCodeStartingConnection, id, revision);
       if (session) {
         for (const form of pending ?? []) {
           if (form.sessionID !== id) continue;
-          await forms.publish(session, form.id, openCode, () =>
-            openCodeConnected && !stopSignal.aborted && sessions.get(key) === session)
+          await forms.publish(session, form.id, openCodeStartingConnection, () =>
+            openCode === openCodeStartingConnection && !stopSignal.aborted && sessions.get(key) === session)
             .catch(() => console.error('Не удалось опубликовать форму OpenCode в Telegram.'));
         }
         for (const request of pendingApprovals ?? []) {
           if (request.sessionID !== id) continue;
-          outgoing = outgoing.then(() => publishOpenCodePermission(openCode, session, request))
+          outgoing = outgoing.then(() => publishOpenCodePermission(openCodeStartingConnection, session, request))
             .catch(() => console.error('Не удалось опубликовать запрос разрешения OpenCode в Telegram.'));
           await outgoing;
         }
       }
     }
-    if (!sessions.size && !openCode) {
+    if (!sessions.size && !openCode && !mayRestore) {
       const reason = openCodeIds.size
         ? 'Ни один сервер не подтвердил подключение указанных сессий.'
         : 'Общий App Server не подтвердил ни одной указанной сессии Codex.';
@@ -395,16 +490,19 @@ async function runReceiver(telegram, profile, threadIds, openCodeIds, stopSignal
         }
         const message = update.message;
         if (!isOwnerMessage(message, profile) || typeof message.text !== 'string' || !message.text.trim()) continue;
+        if (!await textState.claim(message.message_id)) {
+          const previous = await textState.attempt(message.message_id);
+          await sendStatus(previous?.result ?? 'unknown', previous?.agent);
+          continue;
+        }
         const reply = message.reply_to_message;
         await outgoing;
         if (!reply) {
           await askForSession(message);
           continue;
         }
-        const session = reply.from?.id === profile.botId && reply.from.is_bot === true
-          ? messageBindings.get(reply.message_id)
-          : undefined;
-        const result = await deliver(session, message.text);
+        const session = await restoreReply(reply);
+        const result = await deliver(session, message.message_id, message.text);
         if (result === 'unconfirmed') await askForSession(message, true, session);
         else await sendStatus(result, session.agent);
       }
@@ -442,14 +540,21 @@ async function main(args) {
       console.error('Приём выключен. Telegram не подтвердил ID бота и закреплённый личный чат.');
       return 1;
     }
+    let textState;
+    try {
+      textState = await openTextState(profile);
+    } catch {
+      console.error('Приём выключен. Проверьте каталог и права доступа к состоянию восстановления в ~/.telegram.');
+      return 1;
+    }
     const threadIds = new Set(ids.filter((id) => codexId.test(id)).map((id) => id.toLowerCase()));
     const openCodeIds = new Set(ids.filter((id) => openCodeId.test(id)).map((id) => id.slice('opencode:'.length)));
-    return await runReceiver(telegram, profile, threadIds, openCodeIds, stop.signal);
+    return await runReceiver(telegram, profile, textState, threadIds, openCodeIds, stop.signal);
   } catch (error) {
     if (stop.signal.aborted) return 0;
     const reason = error instanceof TelegramError
       ? (error.code === 409 ? 'Конфликт получателей Telegram.' : 'Ошибка связи с Telegram.')
-      : 'Ошибка связи с общим App Server Codex.';
+      : (error?.code ? 'Ошибка доступа к локальному состоянию.' : 'Ошибка связи с общим App Server Codex.');
     console.error(`Приём выключен. ${reason}`);
     return 1;
   } finally {

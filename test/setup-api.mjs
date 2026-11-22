@@ -1,8 +1,10 @@
 // Preloaded into the receiver process to substitute only its external APIs.
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
+import { writeFile } from 'node:fs/promises';
 import { createRequire, syncBuiltinESMExports } from 'node:module';
 import { connect } from 'node:net';
+import { join } from 'node:path';
 import { PassThrough, Transform } from 'node:stream';
 import { WebSocketServer } from 'ws';
 
@@ -32,6 +34,7 @@ const { promise: openCodeViewRead, resolve: recordOpenCodeViewRead } = Promise.w
 let openCodePosts = 0;
 let openCodeStream;
 let openCodeProbes = 0;
+let openCodeSubscriptions = 0;
 let openCodeSecondPublished;
 let openCodeFormState = { status: 'pending' };
 let openCodeChoiceEdits = 0;
@@ -52,6 +55,14 @@ function sendOpenCodeEvent(event) {
   openCodeStream.enqueue(openCodeEncoder.encode(`data: ${JSON.stringify(event)}\n\n`));
 }
 
+function sendOpenCodeViewed(sessionID) {
+  sendOpenCodeEvent({
+    type: 'session.viewed', id: 'viewed', created: 100,
+    durable: { aggregateID: sessionID, seq: 1, version: 1 },
+    data: { sessionID, idle: 50 },
+  });
+}
+
 function record(channel, method, params) {
   process.send({ channel, method, params });
 }
@@ -70,21 +81,24 @@ globalThis.fetch = async (url, options) => {
     record('opencode', `${method} ${target.pathname}`, body);
     const { sessionID, title, text, isolated, form, permission } = scenario.openCode;
     if (target.pathname === '/api/info') {
+      if (scenario.openCode.unavailableOnStartup && polls === 0) {
+        return new Response(null, { status: 503 });
+      }
       const pid = ++openCodeProbes >= 3 && scenario.openCode.replaceProcess ? 5678 : 1234;
       return Response.json({ pid, version: '2.3.2' });
     }
     if (target.pathname === '/api/event') {
+      openCodeSubscriptions++;
       const signal = options?.signal ?? (url instanceof Request ? url.signal : undefined);
       const body = new ReadableStream({
         start(controller) {
           openCodeStream = controller;
           controller.enqueue(openCodeEncoder.encode('data: {"type":"server.connected","id":"connected","data":{}}\n\n'));
-          if (text) sendOpenCodeText(sessionID, text);
-          if (scenario.openCode.viewedOnStartup) sendOpenCodeEvent({
-            type: 'session.viewed', id: 'viewed', created: 100,
-            durable: { aggregateID: sessionID, seq: 1, version: 1 },
-            data: { sessionID, idle: 50 },
-          });
+          if (text && (openCodeSubscriptions === 1 || !scenario.openCode.replaceRegistration)) sendOpenCodeText(sessionID, text);
+          if (scenario.openCode.viewedOnStartup) sendOpenCodeViewed(sessionID);
+          if (scenario.openCode.replaceRegistration && openCodeSubscriptions > 1 && !scenario.openCode.activeOnReconnect) {
+            sendOpenCodeViewed(sessionID);
+          }
           if (form && !scenario.openCode.formAlreadyOpen) sendOpenCodeEvent({
             type: 'form.created', id: 'form-created', created: 1, data: { form },
           });
@@ -98,6 +112,7 @@ globalThis.fetch = async (url, options) => {
     }
     if (target.pathname === '/api/session/active') {
       return Response.json({ data: scenario.openCode.activeOnStartup || openCodePosts > 1
+        || (scenario.openCode.activeOnReconnect && openCodeSubscriptions > 1)
         ? { [sessionID]: { type: 'running' } } : {} });
     }
     if (target.pathname === `/api/session/${sessionID}`) {
@@ -157,7 +172,7 @@ globalThis.fetch = async (url, options) => {
       if (scenario.failStatus && sentCount > 0) {
         return new Response(JSON.stringify({ ok: false, error_code: 503 }), { status: 503 });
       }
-      result = { message_id: ++sentCount, chat: telegram.chat };
+      result = { message_id: (scenario.firstMessageId ?? 1) + sentCount++, chat: telegram.chat };
       if (scenario.codexChoice && !params.reply_parameters && params.text.startsWith('Codex ·')) recordCodexChoice();
       if (params.text.startsWith('OpenCode ·')) {
         openCodePosts++;
@@ -208,7 +223,23 @@ globalThis.fetch = async (url, options) => {
           clearTimeout(deadline);
         }
         if (scenario.openCode?.viewedOnStartup) await openCodeViewRead;
+        if (scenario.openCode?.replaceRegistration) {
+          // The previous SSE stays open while the local registry moves to another server instance.
+          await writeFile(join(process.env.XDG_STATE_HOME, 'opencode', 'service.json'), JSON.stringify({
+            id: 'replacement-fixture-instance', version: '2.3.2', url: 'http://127.0.0.1:32123', pid: 1234,
+            password: 'fixture-not-a-secret',
+          }));
+        }
         result = scenario.updates || [];
+      } else if (polls === 2 && (scenario.openCode?.viewAfterFirstPoll || scenario.codexLoadAfterFirstPoll)) {
+        if (scenario.openCode?.viewAfterFirstPoll) {
+          sendOpenCodeViewed(scenario.openCode.sessionID);
+          await openCodeViewRead;
+        }
+        const previous = scenario.updates[0];
+        result = [{ update_id: previous.update_id + 1, message: {
+          ...previous.message, message_id: previous.message.message_id + 1, text: 'Ответ после открытия исходного диалога',
+        } }];
       } else if (polls === 2 && scenario.openCode?.replacePermission) {
         const { sessionID, permission, replacePermission } = scenario.openCode;
         const { promise, resolve } = Promise.withResolvers();
@@ -370,6 +401,10 @@ childProcess.spawn = (command, args, options) => {
         result = { deleted: !scenario.autoQueueStart };
         break;
       case 'turn/steer':
+        if (scenario.crashDuringSteer) {
+          process.send({ channel: 'fixture', method: 'crash' }, () => process.exit(70));
+          return;
+        }
         if (scenario.changedActiveTurn) {
           emit({ id, error: { code: -32600, message: 'expected turn no longer active' } });
           return;

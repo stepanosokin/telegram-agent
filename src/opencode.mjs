@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
@@ -67,18 +67,22 @@ export async function openOpenCode(onEvent, onDisconnect, stopSignal) {
     return client.session.get({ sessionID }, request());
   }
 
-  async function readReplyableSession(sessionID) {
+  async function readReplyableSession(sessionID, requireActive = false) {
     if (!await currentServer()) return;
     const active = await client.session.active(request());
+    const ownsTurn = active[sessionID]?.type === 'running';
+    if (requireActive && !ownsTurn) return;
     // Read persisted timing last. Prompt does not accept an atomic execution-owner precondition.
     const session = await read(sessionID);
     if (signal.aborted || session?.id !== sessionID || !session.time || session.time.archived !== undefined) return;
     const { busy = 0, idle = 0 } = session.time;
-    if (busy > idle && active[sessionID]?.type !== 'running') return;
+    if (busy > idle && !ownsTurn) return;
     return session;
   }
 
   return {
+    instance: createHash('sha256').update(JSON.stringify(registration)).digest('hex'),
+    currentServer,
     active() {
       return client.session.active(request());
     },
@@ -107,22 +111,25 @@ export async function openOpenCode(onEvent, onDisconnect, stopSignal) {
     async readPermission(sessionID, requestID) {
       if (await currentServer()) return client.permission.get({ sessionID, requestID }, request());
     },
-    async deliver(sessionID, text) {
+    async deliver(sessionID, text, submit) {
       try {
         if (!await readReplyableSession(sessionID)) return 'unconfirmed';
       } catch {
         return 'unconfirmed';
       }
       if (signal.aborted) return 'unconfirmed';
-      try {
-        // Queue the reply in this session without steering a different active execution.
-        const id = `msg_${randomUUID()}`;
-        const receipt = await client.session.prompt({ sessionID, id, text, delivery: 'queue' }, request());
-        return receipt?.id === id && receipt.sessionID === sessionID ? 'delivered' : 'unknown';
-      } catch (error) {
-        return ['InvalidRequestError', 'UnauthorizedError', 'SessionNotFoundError', 'LocationNotFoundError', 'ConflictError']
-          .includes(error?.name) ? 'unavailable' : 'unknown';
-      }
+      return submit(async () => {
+        if (signal.aborted) return 'unavailable';
+        try {
+          // Queue the reply in this session without steering a different active execution.
+          const id = `msg_${randomUUID()}`;
+          const receipt = await client.session.prompt({ sessionID, id, text, delivery: 'queue' }, request());
+          return receipt?.id === id && receipt.sessionID === sessionID ? 'delivered' : 'unknown';
+        } catch (error) {
+          return ['InvalidRequestError', 'UnauthorizedError', 'SessionNotFoundError', 'LocationNotFoundError', 'ConflictError']
+            .includes(error?.name) ? 'unavailable' : 'unknown';
+        }
+      });
     },
     close() {
       controller.abort();

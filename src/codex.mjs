@@ -200,20 +200,22 @@ export function openAppServer(onEvent, onDisconnect) {
         deadline.abort();
       }
     },
-    async deliver(thread, text) {
+    async deliver(thread, text, submit) {
       const threadId = thread.id;
       const input = [{ type: 'text', text, text_elements: [] }];
       if (thread.status.type === 'active') {
         const expectedTurnId = await activeTurnId(threadId).catch(() => undefined);
         if (!expectedTurnId) return 'unavailable';
-        try {
-          const response = await call('turn/steer', { threadId, expectedTurnId, input });
-          return response?.turnId === expectedTurnId ? 'delivered' : 'unknown';
-        } catch (error) {
-          return error instanceof AppServerRejection && error.beforeSubmission ? 'unavailable' : 'unknown';
-        }
+        return submit(async () => {
+          try {
+            const response = await call('turn/steer', { threadId, expectedTurnId, input });
+            return response?.turnId === expectedTurnId ? 'delivered' : 'unknown';
+          } catch (error) {
+            return error instanceof AppServerRejection && error.beforeSubmission ? 'unavailable' : 'unknown';
+          }
+        });
       }
-      return startIdleThread(threadId, input);
+      return submit(() => startIdleThread(threadId, input));
     },
     close,
   };

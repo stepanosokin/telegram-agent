@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { execFile, fork } from 'node:child_process';
 import { once } from 'node:events';
-import { chmod, link, mkdir, mkdtemp, rm, unlink, writeFile } from 'node:fs/promises';
+import { chmod, link, mkdir, mkdtemp, readdir, readFile, rm, unlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
@@ -27,7 +27,7 @@ function newText(text, messageId = 30, updateId = 10) {
   return reply({ text, message_id: messageId, reply_to_message: undefined }, updateId);
 }
 
-async function run(scenario, threads = [primaryThread]) {
+async function run(scenario, threads = [primaryThread], restart) {
   const home = await mkdtemp(join(tmpdir(), 'telegram-agent-test-'));
   const profile = join(home, '.telegram');
   try {
@@ -65,38 +65,53 @@ exit $LASTEXITCODE
       }
     }
     const openCodeState = join(home, 'state');
-    if (scenario.openCode) {
+    async function registerOpenCode(options) {
+      if (!options) return;
       const stateDir = join(openCodeState, 'opencode');
       await mkdir(stateDir, { recursive: true, mode: 0o700 });
       await writeFile(join(stateDir, 'service.json'), JSON.stringify({
-        id: 'fixture-instance', version: '2.3.2', url: scenario.openCode.registrationUrl ?? 'http://127.0.0.1:32123', pid: 1234,
+        id: options.registrationId ?? 'fixture-instance', version: '2.3.2', url: options.registrationUrl ?? 'http://127.0.0.1:32123', pid: 1234,
         password: 'fixture-not-a-secret',
       }), { mode: 0o600 });
     }
-    const child = fork(receiver, ['start', ...threads], {
-      execArgv: ['--import', setup.href],
-      env: {
-        ...process.env,
-        HOME: home,
-        USERPROFILE: home,
-        XDG_STATE_HOME: openCodeState,
-        TELEGRAM_AGENT_SCENARIO: JSON.stringify(scenario),
-      },
-      silent: true,
-    });
-    const calls = [];
-    let stderr = '';
-    child.on('message', (call) => calls.push(call));
-    child.stderr.setEncoding('utf8').on('data', (text) => stderr += text);
-    const deadline = setTimeout(() => child.kill(), 15_000);
-    try {
-      const [code] = await once(child, 'close');
-      return { calls, code, stderr };
-    } finally {
-      clearTimeout(deadline);
+    await registerOpenCode(scenario.openCode);
+    const first = await runReceiver(scenario, threads, home, openCodeState);
+    if (scenario.inspectRecovery) {
+      const directory = join(profile, 'receiver-text-v1-100-200-300');
+      const names = await readdir(directory);
+      first.recovery = await Promise.all(names.map((name) => readFile(join(directory, name), 'utf8')));
+      if (restart) await link(join(directory, 'binding-1'), join(home, 'binding-copy'));
     }
+    if (!restart) return first;
+    await registerOpenCode(restart.openCode);
+    return [first, await runReceiver({ firstMessageId: 50, ...restart }, threads, home, openCodeState)];
   } finally {
     await rm(home, { recursive: true, force: true });
+  }
+}
+
+async function runReceiver(scenario, threads, home, openCodeState) {
+  const child = fork(receiver, ['start', ...threads], {
+    execArgv: ['--import', setup.href],
+    env: {
+      ...process.env,
+      HOME: home,
+      USERPROFILE: home,
+      XDG_STATE_HOME: openCodeState,
+      TELEGRAM_AGENT_SCENARIO: JSON.stringify(scenario),
+    },
+    silent: true,
+  });
+  const calls = [];
+  let stderr = '';
+  child.on('message', (call) => calls.push(call));
+  child.stderr.setEncoding('utf8').on('data', (text) => stderr += text);
+  const deadline = setTimeout(() => child.kill(), 15_000);
+  try {
+    const [code] = await once(child, 'close');
+    return { calls, code, stderr };
+  } finally {
+    clearTimeout(deadline);
   }
 }
 
@@ -719,6 +734,123 @@ test('публикует сообщение Codex и передаёт ответ
   assert.deepEqual(started.params, { threadId: primaryThread, queuedSubmissionId: 'in-queue' });
 });
 
+test('после перезапуска отвечает на прежнее сообщение Codex после живой проверки исходной сессии', async () => {
+  const [first, restarted] = await run({}, [primaryThread], { updates: [reply()] });
+  assert.match(callsFor(first, 'telegram', 'sendMessage')[0]?.params.text, /Ответ 1/);
+  const [{ params }] = callsFor(restarted, 'codex', 'thread/queue/add');
+  assert.equal(params.threadId, primaryThread);
+  assert.equal(params.input[0].text, baseMessage.text);
+});
+
+test('повтор обновления после перезапуска показывает подтверждённую доставку и не пропускает другой текст', async () => {
+  const repeated = reply();
+  const [first, restarted] = await run({ updates: [repeated] }, [primaryThread], {
+    updates: [repeated, reply({ message_id: 31, text: 'Новый ответ' }, 11)],
+  });
+  assert.equal(callsFor(first, 'codex', 'thread/queue/add').length, 1);
+  assert.deepEqual(callsFor(restarted, 'codex', 'thread/queue/add').map(({ params }) => params.input[0].text), ['Новый ответ']);
+  assert.equal(callsFor(restarted, 'telegram', 'sendMessage').filter(({ params }) => /принял ваш ответ/.test(params.text)).length, 2);
+  assert.equal(callsFor(restarted, 'telegram', 'getUpdates')[0]?.params.offset, undefined);
+});
+
+test('после обрыва во время отправки повтор обновления показывает неизвестный исход', async () => {
+  const interrupted = reply();
+  const [first, restarted] = await run({
+    sessions: askingSession, updates: [interrupted], crashDuringSteer: true,
+  }, [primaryThread], { noNewItem: true, updates: [interrupted] });
+  assert.equal(first.code, 70);
+  assert.equal(callsFor(first, 'codex', 'turn/steer').length, 1);
+  assert.equal(callsFor(restarted, 'codex', 'turn/steer').length, 0);
+  assert.equal(callsFor(restarted, 'codex', 'thread/queue/add').length, 0);
+  assert.match(callsFor(restarted, 'telegram', 'sendMessage')[0]?.params.text, /проверьте историю и очередь/i);
+});
+
+test('повтор заведомо недоставленного текста требует нового сообщения владельца', async () => {
+  const failed = reply();
+  const [first, restarted] = await run({ updates: [failed], concurrentTurn: true }, [primaryThread], {
+    updates: [failed, reply({ message_id: 31 }, 11)],
+  });
+  assert.equal(callsFor(first, 'codex', 'thread/queue/delete').length, 1);
+  assert.deepEqual(callsFor(restarted, 'codex', 'thread/queue/add').map(({ params }) => params.input[0].text), [baseMessage.text]);
+  assert.ok(callsFor(restarted, 'telegram', 'sendMessage').some(({ params }) => /отправьте текст новым сообщением/i.test(params.text)));
+});
+
+test('повтор обновления после отказа при проверке хода не отправляет текст автоматически', async () => {
+  const failed = reply();
+  const [first, restarted] = await run({
+    sessions: { [primaryThread]: { status: { type: 'active' }, turns: [] } }, updates: [failed],
+  }, [primaryThread], { sessions: askingSession, updates: [failed] });
+  assert.equal(callsFor(first, 'codex', 'turn/steer').length, 0);
+  assert.equal(callsFor(restarted, 'codex', 'turn/steer').length, 0);
+  assert.ok(callsFor(restarted, 'telegram', 'sendMessage').some(({ params }) => /отправьте текст новым сообщением/i.test(params.text)));
+});
+
+test('журнал хранит только привязку и технический статус и блокирует подмену файла жёсткой ссылкой', async () => {
+  const [first, restarted] = await run({ updates: [reply()], inspectRecovery: true }, [primaryThread], { updates: [reply()] });
+  assert.deepEqual(first.recovery.sort(), [`Codex:${primaryThread}\n`, 'received\nCodex\ndelivered\n']);
+  assert.match(restarted.stderr, /права доступа к состоянию восстановления/);
+  assert.equal(callsFor(restarted, 'telegram', 'getUpdates').length, 0);
+});
+
+test('подписка на Codex сама по себе не восстанавливает старую привязку', async () => {
+  const [, restarted] = await run({}, [primaryThread], { noNewItem: true, updates: [reply()] });
+  assert.equal(callsFor(restarted, 'codex', 'thread/resume').length, 1);
+  assert.equal(callsFor(restarted, 'codex', 'thread/queue/add').length, 0);
+  assert.match(callsFor(restarted, 'telegram', 'sendMessage')[0]?.params.text, /ответ не доставлен/i);
+});
+
+test('после перезапуска на том же сервере OpenCode проверяет старую привязку без нового ответа агента', async () => {
+  const openCode = { sessionID: openCodeSession, title: 'OpenCode' };
+  const [first, restarted] = await run({ openCode: { ...openCode, text: 'Ответ OpenCode' } }, [`opencode:${openCodeSession}`], {
+    openCode, updates: [reply()],
+  });
+  assert.match(callsFor(first, 'telegram', 'sendMessage')[0]?.params.text, /Ответ OpenCode/);
+  const [{ params }] = callsFor(restarted, 'opencode', `POST /api/session/${openCodeSession}/prompt`);
+  assert.equal(params.text, baseMessage.text);
+});
+
+test('старые привязки OpenCode доступны для проверки, когда сервер выключен при запуске получателя', async () => {
+  const openCode = { sessionID: openCodeSession, title: 'OpenCode' };
+  const [, restarted] = await run({ openCode: { ...openCode, text: 'Ответ OpenCode' } }, [`opencode:${openCodeSession}`], {
+    openCode: { ...openCode, unavailableOnStartup: true }, updates: [reply()],
+  });
+  assert.equal(callsFor(restarted, 'opencode', `POST /api/session/${openCodeSession}/prompt`).length, 1);
+  assert.match(callsFor(restarted, 'telegram', 'sendMessage')[0]?.params.text, /OpenCode принял ваш ответ/);
+});
+
+test('после смены сервера OpenCode ждёт открытия исходного диалога и сохраняет прежний адресат', async () => {
+  const openCode = { sessionID: openCodeSession, title: 'OpenCode' };
+  const [, unconfirmed] = await run({ openCode: { ...openCode, text: 'Ответ OpenCode' } }, [`opencode:${openCodeSession}`], {
+    openCode: { ...openCode, registrationId: 'new-server', viewAfterFirstPoll: true }, updates: [reply()],
+  });
+  assert.match(callsFor(unconfirmed, 'telegram', 'sendMessage')[0]?.params.text, /ответ не доставлен/i);
+  const [prompt] = callsFor(unconfirmed, 'opencode', `POST /api/session/${openCodeSession}/prompt`);
+  assert.equal(prompt?.params.text, 'Ответ после открытия исходного диалога');
+});
+
+test('при смене регистрации заново подписывается на OpenCode и проверяет ход, начатый до переподключения', async () => {
+  const result = await run({
+    openCode: {
+      sessionID: openCodeSession, title: 'OpenCode', text: 'Ответ OpenCode', replaceRegistration: true, activeOnReconnect: true,
+    },
+    updates: [reply()],
+  }, [`opencode:${openCodeSession}`]);
+  assert.equal(callsFor(result, 'opencode', 'GET /api/event').length, 2);
+  assert.equal(callsFor(result, 'opencode', `POST /api/session/${openCodeSession}/prompt`).length, 1);
+  assert.match(callsFor(result, 'telegram', 'sendMessage').at(-1)?.params.text, /OpenCode принял ваш ответ/);
+});
+
+test('после перезапуска сервера Codex ждёт ручного возобновления прежней сессии', async () => {
+  const [, restarted] = await run({}, [primaryThread], {
+    loaded: [[], []], codexLoadAfterFirstPoll: true, updates: [reply()],
+  });
+  assert.match(callsFor(restarted, 'telegram', 'sendMessage')[0]?.params.text, /ответ не доставлен/i);
+  assert.equal(callsFor(restarted, 'codex', 'thread/resume').length, 1);
+  const [sent] = callsFor(restarted, 'codex', 'thread/queue/add');
+  assert.equal(sent?.params.threadId, primaryThread);
+  assert.equal(sent?.params.input[0].text, 'Ответ после открытия исходного диалога');
+});
+
 test('сохраняет адресата ответа при нескольких подключённых сессиях', async () => {
   const result = await run({
     sessions: {
@@ -999,8 +1131,8 @@ test('сообщения от неверного автора или чата и
 test('отклоняет непривязанный ответ и не повторяет одно обновление', async () => {
   const result = await run({
     updates: [
-      reply({ reply_to_message: { message_id: 1, from: { id: 101, is_bot: true } } }, 11),
-      reply({ reply_to_message: { message_id: 7000, from: { id: 100, is_bot: true } } }, 12),
+      reply({ message_id: 28, reply_to_message: { message_id: 1, from: { id: 101, is_bot: true } } }, 11),
+      reply({ message_id: 29, reply_to_message: { message_id: 7000, from: { id: 100, is_bot: true } } }, 12),
       reply({}, 13),
       reply({}, 13),
     ],

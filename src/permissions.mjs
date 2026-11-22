@@ -98,14 +98,14 @@ export function permissions(telegram, label, bindMessage) {
       if (!entry.buttons.size) {
         requests.delete(key);
         const context = details?.description && body.length <= 3800 ? body : header;
-        bindMessage(session, await telegram.send(`${context}\n\n${localOnly}`));
+        await bindMessage(session, await telegram.send(`${context}\n\n${localOnly}`));
         return;
       }
       const keyboard = [...entry.buttons].map(([callback_data, { action }]) =>
         [{ text: labels[action], callback_data }]);
       const published = telegram.send(body, { keyboard }).then(async (message) => {
         if (!Number.isSafeInteger(message?.message_id) || message.message_id <= 0) return;
-        bindMessage(session, message);
+        await bindMessage(session, message);
         entry.messageId = message.message_id;
         messages.set(entry.messageId, { entry });
         if (entry.status) await edit(entry, entry.status);
