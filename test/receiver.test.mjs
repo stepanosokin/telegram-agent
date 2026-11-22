@@ -9,6 +9,7 @@ import { promisify } from 'node:util';
 
 const primaryThread = '01900000-0000-7000-8000-000000000001';
 const otherThread = '01900000-0000-7000-8000-000000000002';
+const openCodeSession = 'ses_01900000000070008000000000000001';
 const receiver = new URL('../src/receiver.mjs', import.meta.url);
 const setup = new URL('./setup-api.mjs', import.meta.url);
 const baseMessage = {
@@ -63,12 +64,22 @@ exit $LASTEXITCODE
         await chmod(file, 0o644);
       }
     }
+    const openCodeState = join(home, 'state');
+    if (scenario.openCode) {
+      const stateDir = join(openCodeState, 'opencode');
+      await mkdir(stateDir, { recursive: true, mode: 0o700 });
+      await writeFile(join(stateDir, 'service.json'), JSON.stringify({
+        id: 'fixture-instance', version: '2.3.2', url: scenario.openCode.registrationUrl ?? 'http://127.0.0.1:32123', pid: 1234,
+        password: 'fixture-not-a-secret',
+      }), { mode: 0o600 });
+    }
     const child = fork(receiver, ['start', ...threads], {
       execArgv: ['--import', setup.href],
       env: {
         ...process.env,
         HOME: home,
         USERPROFILE: home,
+        XDG_STATE_HOME: openCodeState,
         TELEGRAM_AGENT_SCENARIO: JSON.stringify(scenario),
       },
       silent: true,
@@ -92,6 +103,106 @@ exit $LASTEXITCODE
 function callsFor(result, channel, method) {
   return result.calls.filter((call) => call.channel === channel && call.method === method);
 }
+
+test('публикует живой текст из OpenCode 2 и передаёт ответ в исходный диалог', async () => {
+  const result = await run({
+    openCode: { sessionID: openCodeSession, title: 'Диалог OpenCode', text: 'Ответ из OpenCode' },
+    updates: [reply()],
+  }, [`opencode:${openCodeSession}`]);
+  assert.match(result.stderr, /конфликт получателей/i);
+  const [published, status] = callsFor(result, 'telegram', 'sendMessage');
+  assert.match(published.params.text, /OpenCode.*Диалог OpenCode\s+Ответ из OpenCode/s);
+  assert.match(status.params.text, /OpenCode принял/);
+  const [prompt] = callsFor(result, 'opencode', `POST /api/session/${openCodeSession}/prompt`);
+  assert.equal(prompt.params.text, baseMessage.text);
+  assert.equal(callsFor(result, 'codex', 'initialize').length, 0);
+});
+
+test('OpenCode требует сверки сервера-владельца, пока идёт изолированный ход', async () => {
+  const result = await run({
+    openCode: { sessionID: openCodeSession, title: 'Один диалог', text: 'Ранее подключённый диалог', isolated: true },
+    updates: [reply()],
+  }, [`opencode:${openCodeSession}`]);
+  const [published, status] = callsFor(result, 'telegram', 'sendMessage');
+  assert.match(published.params.text, /OpenCode.*Один диалог/);
+  assert.match(status.params.text, /сессию OpenCode на компьютере/);
+  assert.equal(callsFor(result, 'opencode', `POST /api/session/${openCodeSession}/prompt`).length, 0);
+});
+
+test('сообщает о неподключённом OpenCode, когда доступна только история', async () => {
+  const result = await run({
+    openCode: { sessionID: openCodeSession, title: 'Сохранённый диалог' },
+    updates: [reply()],
+  }, [`opencode:${openCodeSession}`]);
+  const [status] = callsFor(result, 'telegram', 'sendMessage');
+  assert.match(status.params.text, /сессию OpenCode на компьютере/);
+  assert.equal(callsFor(result, 'opencode', `POST /api/session/${openCodeSession}/prompt`).length, 0);
+});
+
+test('показывает уже активную сессию OpenCode после проверки сервера-владельца', async () => {
+  const result = await run({
+    openCode: { sessionID: openCodeSession, title: 'Ход уже идёт', activeOnStartup: true },
+    updates: [newText('Текст в текущую сессию')],
+    callbacks: [{ prompt: 0, choice: 0 }],
+  }, [`opencode:${openCodeSession}`]);
+  const [menu] = callsFor(result, 'telegram', 'sendMessage');
+  assert.match(menu.params.reply_markup.inline_keyboard[0][0].text, /OpenCode.*Ход уже идёт/);
+  const [prompt] = callsFor(result, 'opencode', `POST /api/session/${openCodeSession}/prompt`);
+  assert.equal(prompt.params.text, 'Текст в текущую сессию');
+});
+
+test('после возобновления OpenCode принимает ответ на новое сообщение того же диалога', async () => {
+  const resumed = reply({ message_id: 31, text: 'Продолжение после сверки', reply_to_message: {
+    message_id: 3, from: baseMessage.reply_to_message.from,
+  } }, 11);
+  const result = await run({
+    openCode: {
+      sessionID: openCodeSession, title: 'Возобновляемый диалог', text: 'Первый ответ', isolated: true,
+      resumedReply: resumed,
+    },
+    updates: [reply()],
+  }, [`opencode:${openCodeSession}`]);
+  const texts = callsFor(result, 'telegram', 'sendMessage').map(({ params }) => params.text);
+  assert.match(texts[1], /сессию OpenCode на компьютере/);
+  assert.match(texts[2], /Возобновляемый диалог\s+Новый ответ после возобновления/);
+  assert.match(texts[3], /OpenCode принял/);
+  assert.deepEqual(callsFor(result, 'opencode', `POST /api/session/${openCodeSession}/prompt`).map(({ params }) => params.text),
+    ['Продолжение после сверки']);
+});
+
+test('не отправляет ответ на совпадающую сессию после смены процесса OpenCode', async () => {
+  const result = await run({
+    openCode: { sessionID: openCodeSession, title: 'То же название', text: 'Ответ исходного сервера', replaceProcess: true },
+    updates: [reply()],
+  }, [`opencode:${openCodeSession}`]);
+  const [, status] = callsFor(result, 'telegram', 'sendMessage');
+  assert.match(status.params.text, /сессию OpenCode на компьютере/);
+  assert.equal(callsFor(result, 'opencode', `POST /api/session/${openCodeSession}/prompt`).length, 0);
+});
+
+test('не использует авторизацию OpenCode для нелокальной регистрации', async () => {
+  const result = await run({
+    openCode: { registrationUrl: 'https://foreign.example' },
+  }, [`opencode:${openCodeSession}`]);
+  assert.match(result.stderr, /не подтвердил подключение/);
+  assert.equal(callsFor(result, 'foreign', '/api/info').length, 0);
+});
+
+test('различает OpenCode и Codex с одинаковым названием сессии через выбор адресата', async () => {
+  const result = await run({
+    sessions: { [primaryThread]: { name: 'Общее название', status: { type: 'idle' } } },
+    openCode: { sessionID: openCodeSession, title: 'Общее название', text: 'Ответ OpenCode' },
+    updates: [newText('Текст только OpenCode')],
+    callbacks: [{ prompt: 0, choice: 1 }],
+  }, [primaryThread, `opencode:${openCodeSession}`]);
+  const prompt = callsFor(result, 'telegram', 'sendMessage')
+    .find(({ params }) => params.reply_parameters?.message_id === 30);
+  const labels = prompt.params.reply_markup.inline_keyboard.flat().map(({ text }) => text);
+  assert.deepEqual(labels.map((label) => label.split(' · ')[0]), ['Codex', 'OpenCode']);
+  assert.equal(callsFor(result, 'codex', 'thread/queue/add').length, 0);
+  const [sent] = callsFor(result, 'opencode', `POST /api/session/${openCodeSession}/prompt`);
+  assert.equal(sent.params.text, 'Текст только OpenCode');
+});
 
 test('публикует сообщение Codex и передаёт ответ в исходную свободную сессию', async () => {
   const result = await run({ updates: [reply()] });

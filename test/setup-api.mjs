@@ -23,12 +23,68 @@ let rpcCount = 0;
 let polls = 0;
 let sentCount = 0;
 const prompts = [];
+const { promise: openCodePublished, resolve: recordOpenCodePublish } = Promise.withResolvers();
+let openCodePosts = 0;
+let openCodeStream;
+let openCodeProbes = 0;
+let openCodeResumePublished;
+const openCodeEncoder = new TextEncoder();
+
+function sendOpenCodeText(id, text) {
+  const event = {
+    type: 'session.text.ended', id: 'text-' + openCodePosts, created: Date.now(),
+    durable: { aggregateID: id, seq: openCodePosts, version: 1 },
+    data: { sessionID: id, assistantMessageID: 'fixture-assistant', ordinal: 0, text },
+  };
+  openCodeStream.enqueue(openCodeEncoder.encode(`data: ${JSON.stringify(event)}\n\n`));
+}
 
 function record(channel, method, params) {
   process.send({ channel, method, params });
 }
 
 globalThis.fetch = async (url, options) => {
+  const target = new URL(url instanceof Request ? url.url : url);
+  if (target.origin === 'https://foreign.example') {
+    record('foreign', target.pathname);
+    return new Response(null, { status: 404 });
+  }
+  if (target.origin === 'http://127.0.0.1:32123') {
+    const headers = new Headers(options?.headers ?? (url instanceof Request ? url.headers : undefined));
+    assert.equal(headers.get('authorization'), 'Basic ' + Buffer.from('opencode:fixture-not-a-secret').toString('base64'));
+    const method = options?.method ?? (url instanceof Request ? url.method : 'GET');
+    const body = options?.body ? JSON.parse(options.body) : method === 'POST' && url instanceof Request ? await url.json() : undefined;
+    record('opencode', `${method} ${target.pathname}`, body);
+    const { sessionID, title, text, isolated } = scenario.openCode;
+    if (target.pathname === '/api/info') {
+      const pid = ++openCodeProbes >= 3 && scenario.openCode.replaceProcess ? 5678 : 1234;
+      return Response.json({ pid, version: '2.3.2' });
+    }
+    if (target.pathname === '/api/event') {
+      const signal = options?.signal ?? (url instanceof Request ? url.signal : undefined);
+      const body = new ReadableStream({
+        start(controller) {
+          openCodeStream = controller;
+          controller.enqueue(openCodeEncoder.encode('data: {"type":"server.connected","id":"connected","data":{}}\n\n'));
+          if (text) sendOpenCodeText(sessionID, text);
+          signal?.addEventListener('abort', () => controller.error(signal.reason), { once: true });
+        },
+      });
+      return new Response(body, { headers: { 'content-type': 'text/event-stream' } });
+    }
+    if (target.pathname === '/api/session/active') {
+      return Response.json({ data: scenario.openCode.activeOnStartup || openCodePosts > 1
+        ? { [sessionID]: { type: 'running' } } : {} });
+    }
+    if (target.pathname === `/api/session/${sessionID}`) {
+      return Response.json({ data: { id: sessionID, title, time: isolated ? { busy: 100, idle: 50 } : {} } });
+    }
+    if (target.pathname === `/api/session/${sessionID}/prompt`) {
+      if (!/^msg_/.test(body.id)) return Response.json({ _tag: 'InvalidRequestError', message: 'Expected a string starting with msg_' }, { status: 400 });
+      return Response.json({ data: { sessionID, id: body.id } });
+    }
+    return new Response(null, { status: 404 });
+  }
   const match = /^https:\/\/api\.telegram\.org\/bot100:fixture-not-a-secret\/([a-zA-Z]+)$/.exec(url);
   assert.ok(match, 'unexpected Telegram endpoint');
   assert.equal(options.method, 'POST');
@@ -50,6 +106,11 @@ globalThis.fetch = async (url, options) => {
         return new Response(JSON.stringify({ ok: false, error_code: 503 }), { status: 503 });
       }
       result = { message_id: ++sentCount, chat: telegram.chat };
+      if (params.text.startsWith('OpenCode ·')) {
+        openCodePosts++;
+        recordOpenCodePublish();
+        if (openCodePosts > 1) openCodeResumePublished?.();
+      }
       if (params.reply_markup?.inline_keyboard.length) {
         const original = scenario.updates.find(({ message }) => message?.message_id === params.reply_parameters.message_id);
         prompts.push({
@@ -64,7 +125,16 @@ globalThis.fetch = async (url, options) => {
       break;
     case 'getUpdates':
       if (++polls === 1) {
+        if (scenario.openCode?.text) {
+          await openCodePublished;
+        }
         result = scenario.updates || [];
+      } else if (polls === 2 && scenario.openCode?.resumedReply) {
+        const { promise, resolve } = Promise.withResolvers();
+        openCodeResumePublished = resolve;
+        sendOpenCodeText(scenario.openCode.sessionID, 'Новый ответ после возобновления');
+        await promise;
+        result = [scenario.openCode.resumedReply];
       } else if (polls === 2 && scenario.callbacks) {
         result = scenario.callbacks.map(({ prompt, choice, tokenFrom = prompt, messageOverrides, ...overrides }, index) => ({
           update_id: 100 + index,
