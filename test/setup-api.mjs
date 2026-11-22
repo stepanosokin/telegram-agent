@@ -26,6 +26,7 @@ let sentCount = 0;
 const prompts = [];
 const { promise: codexChoicePublished, resolve: recordCodexChoice } = Promise.withResolvers();
 const { promise: openCodePublished, resolve: recordOpenCodePublish } = Promise.withResolvers();
+const { promise: openCodeViewRead, resolve: recordOpenCodeViewRead } = Promise.withResolvers();
 let openCodePosts = 0;
 let openCodeStream;
 let openCodeProbes = 0;
@@ -76,6 +77,11 @@ globalThis.fetch = async (url, options) => {
           openCodeStream = controller;
           controller.enqueue(openCodeEncoder.encode('data: {"type":"server.connected","id":"connected","data":{}}\n\n'));
           if (text) sendOpenCodeText(sessionID, text);
+          if (scenario.openCode.viewedOnStartup) sendOpenCodeEvent({
+            type: 'session.viewed', id: 'viewed', created: 100,
+            durable: { aggregateID: sessionID, seq: 1, version: 1 },
+            data: { sessionID, idle: 50 },
+          });
           if (form && !scenario.openCode.formAlreadyOpen) sendOpenCodeEvent({
             type: 'form.created', id: 'form-created', created: 1, data: { form },
           });
@@ -92,6 +98,7 @@ globalThis.fetch = async (url, options) => {
         ? { [sessionID]: { type: 'running' } } : {} });
     }
     if (target.pathname === `/api/session/${sessionID}`) {
+      recordOpenCodeViewRead();
       return Response.json({ data: { id: sessionID, title, time: isolated ? { busy: 100, idle: 50 } : {} } });
     }
     if (target.pathname === `/api/session/${sessionID}/prompt`) {
@@ -196,6 +203,7 @@ globalThis.fetch = async (url, options) => {
           await Promise.race([openCodePublished, new Promise((resolve) => { deadline = setTimeout(resolve, 1500); })]);
           clearTimeout(deadline);
         }
+        if (scenario.openCode?.viewedOnStartup) await openCodeViewRead;
         result = scenario.updates || [];
       } else if (polls === 2 && scenario.openCode?.resumedReply) {
         const { promise, resolve } = Promise.withResolvers();

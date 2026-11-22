@@ -591,6 +591,30 @@ test('сообщает о неподключённом OpenCode, когда до
   assert.equal(callsFor(result, 'opencode', `POST /api/session/${openCodeSession}/prompt`).length, 0);
 });
 
+test('открытие истории не предлагает сессию OpenCode с изолированным ходом в выборе адресата', async () => {
+  const result = await run({
+    openCode: {
+      sessionID: openCodeSession, title: 'Открытая история', isolated: true, viewedOnStartup: true,
+    },
+    updates: [newText('Сообщение для OpenCode')],
+  }, [`opencode:${openCodeSession}`]);
+  const [status] = callsFor(result, 'telegram', 'sendMessage');
+  assert.match(status?.params.text ?? '', /сессию OpenCode на компьютере/);
+  assert.equal(status.params.reply_markup, undefined);
+});
+
+test('после открытия сохранённой сессии на общем сервере OpenCode принимает текст', async () => {
+  const result = await run({
+    openCode: { sessionID: openCodeSession, title: 'Возобновляемый диалог', viewedOnStartup: true },
+    updates: [newText('Текст после открытия диалога')],
+    callbacks: [{ prompt: 0, choice: 0 }],
+  }, [`opencode:${openCodeSession}`]);
+  const [menu] = callsFor(result, 'telegram', 'sendMessage');
+  assert.match(menu.params.reply_markup.inline_keyboard[0][0].text, /OpenCode.*Возобновляемый диалог/);
+  assert.deepEqual(callsFor(result, 'opencode', `POST /api/session/${openCodeSession}/prompt`)
+    .map(({ params }) => params.text), ['Текст после открытия диалога']);
+});
+
 test('показывает уже активную сессию OpenCode после проверки сервера-владельца', async () => {
   const result = await run({
     openCode: { sessionID: openCodeSession, title: 'Ход уже идёт', activeOnStartup: true },

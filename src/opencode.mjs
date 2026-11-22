@@ -63,13 +63,27 @@ export async function openOpenCode(onEvent, onDisconnect, stopSignal) {
     return !signal.aborted && current.pid === server.pid && current.version === server.version;
   }
 
+  async function read(sessionID) {
+    return client.session.get({ sessionID }, request());
+  }
+
+  async function readReplyableSession(sessionID) {
+    if (!await currentServer()) return;
+    const active = await client.session.active(request());
+    // Read persisted timing last. Prompt does not accept an atomic execution-owner precondition.
+    const session = await read(sessionID);
+    if (signal.aborted || session?.id !== sessionID || !session.time || session.time.archived !== undefined) return;
+    const { busy = 0, idle = 0 } = session.time;
+    if (busy > idle && active[sessionID]?.type !== 'running') return;
+    return session;
+  }
+
   return {
     active() {
       return client.session.active(request());
     },
-    read(sessionID) {
-      return client.session.get({ sessionID }, request());
-    },
+    read,
+    readReplyableSession,
     async pendingForms(sessionID) {
       if (await currentServer()) return client.session.form.list({ sessionID }, request());
     },
@@ -95,13 +109,7 @@ export async function openOpenCode(onEvent, onDisconnect, stopSignal) {
     },
     async deliver(sessionID, text) {
       try {
-        if (!await currentServer()) return 'unconfirmed';
-        const active = await client.session.active(request());
-        // Read persisted timing last. Prompt does not accept an atomic execution-owner precondition.
-        const session = await client.session.get({ sessionID }, request());
-        if (session?.id !== sessionID || !session.time || session.time.archived !== undefined) return 'unconfirmed';
-        const { busy = 0, idle = 0 } = session.time;
-        if (busy > idle && active[sessionID]?.type !== 'running') return 'unconfirmed';
+        if (!await readReplyableSession(sessionID)) return 'unconfirmed';
       } catch {
         return 'unconfirmed';
       }

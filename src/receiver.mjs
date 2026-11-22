@@ -179,7 +179,7 @@ async function runReceiver(telegram, profile, threadIds, openCodeIds, stopSignal
         const active = await connection.active().catch(() => undefined);
         if (active?.[id]?.type !== 'running') return;
       }
-      const session = await confirmOpenCodeSession(connection, id, revision);
+      const session = await confirmOpenCodeSession(connection, id, revision, event.type === 'session.viewed');
       if (session && event.type === 'form.created') {
         await forms.publish(session, event.data.form.id, connection, () =>
           openCodeConnected && !stopSignal.aborted && sessions.get(key) === session);
@@ -208,11 +208,17 @@ async function runReceiver(telegram, profile, threadIds, openCodeIds, stopSignal
     });
   }
 
-  async function confirmOpenCodeSession(connection, id, revision) {
+  async function confirmOpenCodeSession(connection, id, revision, verifyReplyable = false) {
     const key = `OpenCode:${id}`;
-    const data = await connection.read(id).catch(() => undefined);
-    if (!openCodeConnected || openCodeRevisions.get(key) !== revision
-      || data?.id !== id || !data.time || data.time.archived !== undefined) return;
+    // Viewing a dialog can load history without taking ownership of a running turn.
+    const read = verifyReplyable ? connection.readReplyableSession : connection.read;
+    const data = await read(id).catch(() => undefined);
+    if (!openCodeConnected || openCodeRevisions.get(key) !== revision) return;
+    if (data?.id !== id || !data.time || data.time.archived !== undefined) {
+      const session = sessions.get(key);
+      if (verifyReplyable && session) session.confirmed = false;
+      return;
+    }
     const session = sessions.get(key) ?? { agent: 'OpenCode', key, id, suffix: sessionSuffix(id, openCodeIds) };
     session.name = typeof data.title === 'string' ? data.title : '';
     session.confirmed = true;
