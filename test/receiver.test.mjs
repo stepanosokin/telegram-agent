@@ -267,6 +267,131 @@ test('публикует живой текст из OpenCode 2 и передаё
   assert.equal(callsFor(result, 'codex', 'initialize').length, 0);
 });
 
+const colorForm = {
+  id: 'form_color', sessionID: openCodeSession, title: 'Настройка цвета',
+  fields: [{
+    key: 'color', type: 'string', title: 'Какой цвет выбрать?', required: true,
+    options: [{ value: 'blue', label: 'Синий' }, { value: 'green', label: 'Зелёный', description: 'Цвет листвы' }],
+  }],
+};
+
+test('отправляет значение выбранного варианта в открытую форму OpenCode 2', async () => {
+  const result = await run({
+    openCode: { sessionID: openCodeSession, title: 'Диалог OpenCode', form: colorForm },
+    callbacks: [{ prompt: 0, choice: 1 }, { prompt: 0, choice: 2 }, { prompt: 0, choice: 2 }],
+  }, [`opencode:${openCodeSession}`]);
+  const [published] = callsFor(result, 'telegram', 'sendMessage');
+  assert.match(published?.params.text ?? '', /OpenCode.*Диалог OpenCode\s+Настройка цвета\s+1\. Какой цвет выбрать\?.*Цвет листвы/s);
+  const [answer] = callsFor(result, 'opencode', `POST /api/session/${openCodeSession}/form/${colorForm.id}/reply`);
+  assert.deepEqual(answer?.params, { answer: { color: 'green' } });
+  assert.equal(callsFor(result, 'opencode', `POST /api/session/${openCodeSession}/form/${colorForm.id}/reply`).length, 1);
+  const complete = callsFor(result, 'telegram', 'editMessageText').at(-1);
+  assert.match(complete?.params.text ?? '', /OpenCode принял ответ.*Зелёный/s);
+  assert.deepEqual(complete.params.reply_markup.inline_keyboard, []);
+});
+
+test('отклоняет отправку формы OpenCode, закрытой другим клиентом между выбором и подтверждением', async () => {
+  const result = await run({
+    openCode: {
+      sessionID: openCodeSession, title: 'Диалог OpenCode', form: colorForm,
+      callbacksAfterClose: [{ prompt: 0, choice: 2 }],
+    },
+    callbacks: [{ prompt: 0, choice: 0 }],
+  }, [`opencode:${openCodeSession}`]);
+  const acknowledgements = callsFor(result, 'telegram', 'answerCallbackQuery');
+  assert.match(acknowledgements.at(-1)?.params.text ?? '', /Форма OpenCode недоступна/);
+  const complete = callsFor(result, 'telegram', 'editMessageText').at(-1);
+  assert.match(complete?.params.text ?? '', /Форма OpenCode недоступна/);
+  assert.deepEqual(complete.params.reply_markup.inline_keyboard, []);
+  assert.equal(callsFor(result, 'opencode', `POST /api/session/${openCodeSession}/form/${colorForm.id}/reply`).length, 0);
+});
+
+test('передаёт полный ответ на несколько вопросов OpenCode с множественным выбором', async () => {
+  const form = {
+    ...colorForm,
+    fields: [...colorForm.fields, {
+      key: 'shapes', type: 'multiselect', title: 'Какие фигуры выбрать?', required: true, minItems: 2, maxItems: 2,
+      options: [{ value: 'circle', label: 'Круг' }, { value: 'square', label: 'Квадрат' }, { value: 'star', label: 'Звезда' }],
+    }],
+  };
+  const result = await run({
+    openCode: { sessionID: openCodeSession, title: 'Диалог OpenCode', form },
+    callbacks: [
+      { prompt: 0, choice: 1 }, { prompt: 0, choice: 4 }, { prompt: 0, choice: 5 },
+      { prompt: 0, choice: 2 }, { prompt: 0, choice: 3 }, { prompt: 0, choice: 5 },
+    ],
+  }, [`opencode:${openCodeSession}`]);
+  const [published] = callsFor(result, 'telegram', 'sendMessage');
+  assert.match(published.params.text, /1\. Какой цвет выбрать\?.*2\. Какие фигуры выбрать\? \(несколько вариантов\)/s);
+  const acknowledgements = callsFor(result, 'telegram', 'answerCallbackQuery');
+  assert.match(acknowledgements[2].params.text, /допустимое число вариантов/);
+  assert.match(acknowledgements[4].params.text, /максимальное число вариантов/);
+  const replies = callsFor(result, 'opencode', `POST /api/session/${openCodeSession}/form/${colorForm.id}/reply`);
+  assert.deepEqual(replies.map(({ params }) => params), [{ answer: { color: 'green', shapes: ['circle', 'star'] } }]);
+  assert.match(callsFor(result, 'telegram', 'editMessageText').at(-1).params.text, /принял ответ.*Зелёный.*Круг, Звезда/s);
+});
+
+test('не отвечает на форму OpenCode за другого владельца, в другом чате и с другого сообщения', async () => {
+  const result = await run({
+    openCode: { sessionID: openCodeSession, title: 'Диалог OpenCode', form: colorForm },
+    callbacks: [
+      { prompt: 0, choice: 0, from: { id: 999, is_bot: false } },
+      { prompt: 0, choice: 0, messageOverrides: { chat: { id: 999, type: 'private' } } },
+      { prompt: 0, choice: 0, messageOverrides: { message_id: 999 } },
+      { prompt: 0, choice: 2 },
+    ],
+  }, [`opencode:${openCodeSession}`]);
+  const acknowledgements = callsFor(result, 'telegram', 'answerCallbackQuery');
+  assert.deepEqual(acknowledgements.map(({ params }) => params.callback_query_id), ['callback-2', 'callback-3']);
+  assert.match(acknowledgements[0].params.text, /Форма OpenCode недоступна/);
+  assert.match(acknowledgements[1].params.text, /каждого обязательного вопроса/);
+  assert.equal(callsFor(result, 'opencode', `POST /api/session/${openCodeSession}/form/${colorForm.id}/reply`).length, 0);
+});
+
+test('показывает закрытие формы и не повторяет POST при конкурентном ответе клиента OpenCode', async () => {
+  const result = await run({
+    openCode: { sessionID: openCodeSession, title: 'Диалог OpenCode', form: colorForm, closeFormOnReply: true },
+    callbacks: [{ prompt: 0, choice: 0 }, { prompt: 0, choice: 2 }, { prompt: 0, choice: 2 }],
+  }, [`opencode:${openCodeSession}`]);
+  const replies = callsFor(result, 'opencode', `POST /api/session/${openCodeSession}/form/${colorForm.id}/reply`);
+  assert.equal(replies.length, 1);
+  const acknowledgements = callsFor(result, 'telegram', 'answerCallbackQuery');
+  assert.match(acknowledgements.at(-1).params.text, /Форма OpenCode недоступна/);
+  assert.match(callsFor(result, 'telegram', 'editMessageText').at(-1).params.text, /Форма OpenCode недоступна/);
+});
+
+test('показывает уже открытую форму OpenCode с выбранным допустимым значением по умолчанию', async () => {
+  const form = { ...colorForm, fields: [{ ...colorForm.fields[0], default: 'green' }] };
+  const result = await run({
+    openCode: { sessionID: openCodeSession, title: 'Диалог OpenCode', form, formAlreadyOpen: true },
+    callbacks: [{ prompt: 0, choice: 2 }],
+  }, [`opencode:${openCodeSession}`]);
+  assert.match(callsFor(result, 'telegram', 'sendMessage')[0]?.params.reply_markup.inline_keyboard[1][0].text ?? '', /✓ 1\. Зелёный/);
+  const replies = callsFor(result, 'opencode', `POST /api/session/${openCodeSession}/form/${colorForm.id}/reply`);
+  assert.deepEqual(replies.map(({ params }) => params), [{ answer: { color: 'green' } }]);
+});
+
+test('сохраняет снятие кнопок, когда OpenCode закрыл форму во время обновления выбранного варианта', async () => {
+  const result = await run({
+    openCode: { sessionID: openCodeSession, title: 'Диалог OpenCode', form: colorForm, closeDuringChoiceEdit: true },
+    callbacks: [{ prompt: 0, choice: 0 }, { prompt: 0, choice: 2 }],
+  }, [`opencode:${openCodeSession}`]);
+  const edits = callsFor(result, 'telegram-applied', 'editMessageText');
+  assert.equal(edits.length, 2);
+  assert.deepEqual(edits.at(-1).params.reply_markup.inline_keyboard, []);
+  assert.match(edits.at(-1).params.text, /Форма OpenCode недоступна/);
+  assert.equal(callsFor(result, 'opencode', `POST /api/session/${openCodeSession}/form/${colorForm.id}/reply`).length, 0);
+});
+
+test('отклоняет отправку формы OpenCode после неподтверждённого обновления выбора в Telegram', async () => {
+  const result = await run({
+    openCode: { sessionID: openCodeSession, title: 'Диалог OpenCode', form: colorForm, failFirstChoiceEdit: true },
+    callbacks: [{ prompt: 0, choice: 0 }, { prompt: 0, choice: 2 }],
+  }, [`opencode:${openCodeSession}`]);
+  assert.equal(callsFor(result, 'opencode', `POST /api/session/${openCodeSession}/form/${colorForm.id}/reply`).length, 0);
+  assert.match(callsFor(result, 'telegram', 'answerCallbackQuery').at(-1)?.params.text ?? '', /выбор в Telegram не подтверждён/i);
+});
+
 test('OpenCode требует сверки сервера-владельца, пока идёт изолированный ход', async () => {
   const result = await run({
     openCode: { sessionID: openCodeSession, title: 'Один диалог', text: 'Ранее подключённый диалог', isolated: true },

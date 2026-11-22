@@ -55,6 +55,14 @@ export async function openOpenCode(onEvent, onDisconnect, stopSignal) {
   const isConnected = await ready.finally(() => clearTimeout(timeout));
   if (!isConnected || signal.aborted) return;
 
+  async function currentServer() {
+    const registered = await localRegistration(file);
+    if (registered?.id !== registration.id || registered?.pid !== registration.pid
+      || registered?.origin !== registration.origin) return false;
+    const current = await client.server.info(request());
+    return !signal.aborted && current.pid === server.pid && current.version === server.version;
+  }
+
   return {
     active() {
       return client.session.active(request());
@@ -62,13 +70,26 @@ export async function openOpenCode(onEvent, onDisconnect, stopSignal) {
     read(sessionID) {
       return client.session.get({ sessionID }, request());
     },
+    async pendingForms(sessionID) {
+      if (await currentServer()) return client.session.form.list({ sessionID }, request());
+    },
+    async readForm(sessionID, formID) {
+      if (await currentServer()) return client.session.form.get({ sessionID, formID }, request());
+    },
+    async replyForm(sessionID, formID, answer, canReply) {
+      if (!(await currentServer().catch(() => false)) || !canReply()) return 'closed';
+      try {
+        await client.session.form.reply({ sessionID, formID, answer }, request());
+        return 'accepted';
+      } catch (error) {
+        if (['FormAlreadySettledError', 'FormNotFoundError', 'SessionNotFoundError']
+          .includes(error?.name)) return 'closed';
+        return 'unknown';
+      }
+    },
     async deliver(sessionID, text) {
       try {
-        const registered = await localRegistration(file);
-        if (registered?.id !== registration.id || registered?.pid !== registration.pid
-          || registered?.origin !== registration.origin) return 'unconfirmed';
-        const current = await client.server.info(request());
-        if (current.pid !== server.pid || current.version !== server.version) return 'unconfirmed';
+        if (!await currentServer()) return 'unconfirmed';
         const active = await client.session.active(request());
         // Read persisted timing last. Prompt does not accept an atomic execution-owner precondition.
         const session = await client.session.get({ sessionID }, request());

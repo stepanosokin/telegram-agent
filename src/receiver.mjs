@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { openAppServer } from './codex.mjs';
 import { codexChoices } from './codex-choices.mjs';
+import { openCodeForms } from './opencode-forms.mjs';
 import { readProfile } from './profile.mjs';
 import { isOwnerCallback, isOwnerMessage, telegramClient, TelegramError } from './telegram.mjs';
 
@@ -44,6 +45,7 @@ async function runReceiver(telegram, profile, threadIds, openCodeIds, stopSignal
   const defaultAgent = !openCodeIds.size ? 'Codex' : !threadIds.size ? 'OpenCode' : undefined;
   let outgoing = Promise.resolve();
   const choices = codexChoices(telegram, (session) => sessionLabel(session, 160));
+  const forms = openCodeForms(telegram, (session) => sessionLabel(session, 160));
 
   async function publish(session, body) {
     if (!body.trim()) return;
@@ -105,18 +107,24 @@ async function runReceiver(telegram, profile, threadIds, openCodeIds, stopSignal
   const openCodeRevisions = new Map();
   function clearOpenCodeSessions() {
     openCodeConnected = false;
+    forms.close();
     for (const [key, session] of sessions) {
       if (session.agent === 'OpenCode') sessions.delete(key);
     }
   }
 
   function onOpenCodeEvent(event) {
-    const id = event.data?.sessionID;
+    const id = event.type === 'form.created' ? event.data?.form?.sessionID : event.data?.sessionID;
     if (!openCodeIds.has(id)) return;
     const key = `OpenCode:${id}`;
+    if (event.type === 'form.replied' || event.type === 'form.cancelled') {
+      forms.close(id, event.data.id);
+      return;
+    }
     if (event.type === 'session.deleted' || event.type === 'session.archived') {
       openCodeRevisions.set(key, Symbol());
       sessions.delete(key);
+      forms.close(id);
       return;
     }
     if (event.type === 'session.renamed') {
@@ -124,7 +132,7 @@ async function runReceiver(telegram, profile, threadIds, openCodeIds, stopSignal
       if (session && typeof event.data.title === 'string') session.name = event.data.title;
       return;
     }
-    if (!['session.text.ended', 'session.viewed', 'session.execution.started'].includes(event.type)) return;
+    if (!['session.text.ended', 'session.viewed', 'session.execution.started', 'form.created'].includes(event.type)) return;
     const revision = openCodeRevisions.get(key);
     outgoing = outgoing.then(async () => {
       const connection = await openCodeReady;
@@ -134,6 +142,10 @@ async function runReceiver(telegram, profile, threadIds, openCodeIds, stopSignal
         if (active?.[id]?.type !== 'running') return;
       }
       const session = await confirmOpenCodeSession(connection, id, revision);
+      if (session && event.type === 'form.created') {
+        await forms.publish(session, event.data.form.id, connection, () =>
+          openCodeConnected && !stopSignal.aborted && sessions.get(key) === session);
+      }
       if (session && event.type === 'session.text.ended' && typeof event.data.text === 'string') {
         await publish(session, event.data.text);
       }
@@ -217,7 +229,7 @@ async function runReceiver(telegram, profile, threadIds, openCodeIds, stopSignal
     if (result === 'delivered' || result === 'unknown') {
       draft.result = result;
       draft.text = undefined;
-      await telegram.completeChoice(promptId, `${sessionLabel(session, 160)}\n\n${deliveryStatus(result, session.agent)}`)
+      await telegram.editChoice(promptId, `${sessionLabel(session, 160)}\n\n${deliveryStatus(result, session.agent)}`)
         .catch(() => sendStatus(result, session.agent));
     } else {
       await sendStatus('unavailable', session.agent);
@@ -269,6 +281,19 @@ async function runReceiver(telegram, profile, threadIds, openCodeIds, stopSignal
       if (active?.[id]?.type === 'running') {
         await confirmOpenCodeSession(openCode, id, openCodeRevisions.get(`OpenCode:${id}`));
       }
+      const key = `OpenCode:${id}`;
+      const revision = openCodeRevisions.get(key);
+      const pending = await openCode?.pendingForms(id).catch(() => undefined);
+      if (!pending?.length) continue;
+      const session = await confirmOpenCodeSession(openCode, id, revision);
+      if (session) {
+        for (const form of pending) {
+          if (form.sessionID !== id) continue;
+          await forms.publish(session, form.id, openCode, () =>
+            openCodeConnected && !stopSignal.aborted && sessions.get(key) === session)
+            .catch(() => console.error('Не удалось опубликовать форму OpenCode в Telegram.'));
+        }
+      }
     }
     if (!sessions.size && !openCode) {
       const reason = openCodeIds.size
@@ -290,6 +315,7 @@ async function runReceiver(telegram, profile, threadIds, openCodeIds, stopSignal
         if (update.callback_query) {
           if (!isOwnerCallback(update.callback_query, profile)) continue;
           if (await choices.handle(update.callback_query, confirmCodexTurn, (id, result) => codex.respond(id, result))) continue;
+          if (await forms.handle(update.callback_query)) continue;
           await chooseSession(update.callback_query);
           continue;
         }

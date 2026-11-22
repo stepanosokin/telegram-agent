@@ -47,12 +47,13 @@ export function telegramClient(profile, stopSignal) {
     answerCallback(id, text) {
       return call('answerCallbackQuery', { callback_query_id: id, text });
     },
-    completeChoice(messageId, text) {
+    /** @param {{text: string, callback_data: string}[][]} [keyboard] */
+    editChoice(messageId, text, keyboard = []) {
       return call('editMessageText', {
         chat_id: profile.chatId,
         message_id: messageId,
         text,
-        reply_markup: { inline_keyboard: [] },
+        reply_markup: { inline_keyboard: keyboard },
       });
     },
     updates(offset) {

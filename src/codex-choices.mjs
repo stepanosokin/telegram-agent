@@ -38,7 +38,7 @@ export function codexChoices(telegram, label) {
     messages.set(entry.messageId, { status, tokens: new Set(prompt.choices.keys()) });
     const summary = `${entry.header}\n\n${status}`;
     const text = summary.length + details.length <= 4096 ? summary + details : summary;
-    await telegram.completeChoice(entry.messageId, text)
+    await telegram.editChoice(entry.messageId, text)
       .catch(() => console.error('Telegram не подтвердил обновление статуса запроса Codex.'));
   }
 

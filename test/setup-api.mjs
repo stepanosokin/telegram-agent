@@ -29,6 +29,8 @@ let openCodePosts = 0;
 let openCodeStream;
 let openCodeProbes = 0;
 let openCodeResumePublished;
+let openCodeFormState = { status: 'pending' };
+let openCodeChoiceEdits = 0;
 let emitCodexPacket;
 const openCodeEncoder = new TextEncoder();
 
@@ -38,6 +40,10 @@ function sendOpenCodeText(id, text) {
     durable: { aggregateID: id, seq: openCodePosts, version: 1 },
     data: { sessionID: id, assistantMessageID: 'fixture-assistant', ordinal: 0, text },
   };
+  sendOpenCodeEvent(event);
+}
+
+function sendOpenCodeEvent(event) {
   openCodeStream.enqueue(openCodeEncoder.encode(`data: ${JSON.stringify(event)}\n\n`));
 }
 
@@ -57,7 +63,7 @@ globalThis.fetch = async (url, options) => {
     const method = options?.method ?? (url instanceof Request ? url.method : 'GET');
     const body = options?.body ? JSON.parse(options.body) : method === 'POST' && url instanceof Request ? await url.json() : undefined;
     record('opencode', `${method} ${target.pathname}`, body);
-    const { sessionID, title, text, isolated } = scenario.openCode;
+    const { sessionID, title, text, isolated, form } = scenario.openCode;
     if (target.pathname === '/api/info') {
       const pid = ++openCodeProbes >= 3 && scenario.openCode.replaceProcess ? 5678 : 1234;
       return Response.json({ pid, version: '2.3.2' });
@@ -69,6 +75,9 @@ globalThis.fetch = async (url, options) => {
           openCodeStream = controller;
           controller.enqueue(openCodeEncoder.encode('data: {"type":"server.connected","id":"connected","data":{}}\n\n'));
           if (text) sendOpenCodeText(sessionID, text);
+          if (form && !scenario.openCode.formAlreadyOpen) sendOpenCodeEvent({
+            type: 'form.created', id: 'form-created', created: 1, data: { form },
+          });
           signal?.addEventListener('abort', () => controller.error(signal.reason), { once: true });
         },
       });
@@ -84,6 +93,24 @@ globalThis.fetch = async (url, options) => {
     if (target.pathname === `/api/session/${sessionID}/prompt`) {
       if (!/^msg_/.test(body.id)) return Response.json({ _tag: 'InvalidRequestError', message: 'Expected a string starting with msg_' }, { status: 400 });
       return Response.json({ data: { sessionID, id: body.id } });
+    }
+    if (form && target.pathname === `/api/session/${sessionID}/form`) {
+      return Response.json({ data: openCodeFormState.status === 'pending' ? [form] : [] });
+    }
+    if (form && target.pathname === `/api/session/${sessionID}/form/${form.id}`) {
+      return Response.json({ data: { ...form, state: openCodeFormState } });
+    }
+    if (form && target.pathname === `/api/session/${sessionID}/form/${form.id}/reply`) {
+      if (scenario.openCode.closeFormOnReply) openCodeFormState = { status: 'cancelled' };
+      if (openCodeFormState.status !== 'pending') {
+        return Response.json({ _tag: 'FormAlreadySettledError', id: form.id, message: 'Form already settled' }, { status: 409 });
+      }
+      openCodeFormState = { status: 'answered', answer: body.answer };
+      sendOpenCodeEvent({
+        type: 'form.replied', id: 'form-replied', created: 2,
+        data: { id: form.id, sessionID, answer: body.answer },
+      });
+      return new Response(null, { status: 204 });
     }
     return new Response(null, { status: 404 });
   }
@@ -125,8 +152,24 @@ globalThis.fetch = async (url, options) => {
         }
       }
       break;
-    case 'answerCallbackQuery':
     case 'editMessageText':
+      if (scenario.openCode?.form && params.reply_markup.inline_keyboard.length && ++openCodeChoiceEdits === 1) {
+        if (scenario.openCode.failFirstChoiceEdit) {
+          return new Response(JSON.stringify({ ok: false, error_code: 503 }), { status: 503 });
+        }
+        if (scenario.openCode.closeDuringChoiceEdit) {
+          const { form, sessionID } = scenario.openCode;
+          openCodeFormState = { status: 'cancelled' };
+          sendOpenCodeEvent({
+            type: 'form.cancelled', id: 'form-cancelled', created: 2, data: { id: form.id, sessionID },
+          });
+          await new Promise((resolve) => setTimeout(resolve, 50));
+        }
+      }
+      record('telegram-applied', method, params);
+      result = true;
+      break;
+    case 'answerCallbackQuery':
       result = true;
       break;
     case 'getUpdates':
@@ -136,9 +179,7 @@ globalThis.fetch = async (url, options) => {
           await Promise.race([codexChoicePublished, new Promise((resolve) => { deadline = setTimeout(resolve, 1000); })]);
           clearTimeout(deadline);
         }
-        if (scenario.openCode?.text) {
-          await openCodePublished;
-        }
+        if (scenario.openCode?.text || scenario.openCode?.form) await openCodePublished;
         result = scenario.updates || [];
       } else if (polls === 2 && scenario.openCode?.resumedReply) {
         const { promise, resolve } = Promise.withResolvers();
@@ -148,16 +189,14 @@ globalThis.fetch = async (url, options) => {
         result = [scenario.openCode.resumedReply];
       } else if (polls === 2 && scenario.callbacks) {
         if (scenario.beforeChoice) emitCodexPacket(scenario.beforeChoice);
-        result = scenario.callbacks.map(({ prompt, choice, tokenFrom = prompt, messageOverrides, ...overrides }, index) => ({
-          update_id: 100 + index,
-          callback_query: {
-            id: `callback-${index}`,
-            from: { id: 300, is_bot: false },
-            message: { ...prompts[prompt]?.message, ...messageOverrides },
-            data: prompts[tokenFrom]?.choices[choice]?.callback_data,
-            ...overrides,
-          },
-        }));
+        result = scenario.callbacks.map((callback, index) => makeCallback(callback, index));
+      } else if (polls === 3 && scenario.openCode?.callbacksAfterClose) {
+        const { sessionID, form } = scenario.openCode;
+        openCodeFormState = { status: 'cancelled' };
+        sendOpenCodeEvent({
+          type: 'form.cancelled', id: 'form-cancelled', created: 2, data: { id: form.id, sessionID },
+        });
+        result = scenario.openCode.callbacksAfterClose.map((callback, index) => makeCallback(callback, 100 + index));
       } else {
         return new Response(JSON.stringify({ ok: false, error_code: 409 }), { status: 409 });
       }
@@ -167,6 +206,19 @@ globalThis.fetch = async (url, options) => {
   }
   return Response.json({ ok: true, result });
 };
+
+function makeCallback({ prompt, choice, tokenFrom = prompt, messageOverrides, ...overrides }, index) {
+  return {
+    update_id: 100 + index,
+    callback_query: {
+      id: `callback-${index}`,
+      from: { id: 300, is_bot: false },
+      message: { ...prompts[prompt]?.message, ...messageOverrides },
+      data: prompts[tokenFrom]?.choices[choice]?.callback_data,
+      ...overrides,
+    },
+  };
+}
 
 childProcess.spawn = (command, args, options) => {
   if (command !== 'codex') return spawn(command, args, options);
