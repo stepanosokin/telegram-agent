@@ -1,0 +1,10 @@
+{
+  "name": "telegram-agent",
+  "private": true,
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "test": "node --test \"test/*.test.mjs\""
+  }
+}
