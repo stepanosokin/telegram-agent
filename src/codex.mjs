@@ -1,8 +1,11 @@
 import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
 import { Duplex } from 'node:stream';
 import { setTimeout as delay } from 'node:timers/promises';
 import WebSocket from 'ws';
+import { codexInstance } from './codex-instance.mjs';
 
 class AppServerRejection extends Error {
   constructor(code) {
@@ -11,7 +14,10 @@ class AppServerRejection extends Error {
   }
 }
 
-export function openAppServer(onEvent, onDisconnect) {
+export async function openAppServer(onEvent, onDisconnect) {
+  const home = process.env.CODEX_HOME ?? join(homedir(), '.codex');
+  const before = await codexInstance(home);
+  let instance = randomUUID();
   const proxy = spawn('codex', ['app-server', 'proxy'], {
     stdio: ['pipe', 'pipe', 'ignore'],
     windowsHide: true,
@@ -158,12 +164,16 @@ export function openAppServer(onEvent, onDisconnect) {
   }
 
   return {
+    get instance() { return instance; },
     async initialize() {
       if (!await ready || closed) throw disconnected;
-      await call('initialize', {
+      const initialized = await call('initialize', {
         clientInfo: { name: 'telegram-agent', version: '0.1.0' },
         capabilities: { experimentalApi: true },
       });
+      const after = before && typeof initialized?.codexHome === 'string' && await codexInstance(initialized.codexHome);
+      if (before && before === after) instance = before;
+      if (closed) throw disconnected;
       write({ method: 'initialized' });
     },
     async isLoaded(threadId) {

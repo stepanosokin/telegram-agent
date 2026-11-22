@@ -25,7 +25,7 @@ function readQuestions(questions) {
   return questions;
 }
 
-export function codexChoices(telegram, label) {
+export function codexChoices(telegram, label, buttonState) {
   const requests = new Map();
   const seen = new Set();
   const messages = new Map();
@@ -35,11 +35,11 @@ export function codexChoices(telegram, label) {
     entry.status = status;
     if (entry.messageId === undefined) return;
     const prompt = messages.get(entry.messageId);
-    messages.set(entry.messageId, { status, tokens: new Set(prompt.choices.keys()) });
+    if (prompt?.entry === entry) messages.set(entry.messageId, { status, tokens: new Set(prompt.choices.keys()) });
     const summary = `${entry.header}\n\n${status}`;
     const text = summary.length + details.length <= 4096 ? summary + details : summary;
-    await telegram.editChoice(entry.messageId, text)
-      .catch(() => console.error('Telegram не подтвердил обновление статуса запроса Codex.'));
+    await buttonState.complete(entry.messageId, status === sent ? 'sent' : status === unknown ? 'unknown' : 'closed',
+      () => telegram.editChoice(entry.messageId, text).then(() => true, () => false));
   }
 
   function close(entry, resolution = false) {
@@ -91,7 +91,8 @@ export function codexChoices(telegram, label) {
         return;
       }
 
-      const published = telegram.send(body, { keyboard }).then(async (message) => {
+      const published = buttonState.publish('codex', session, id, params, body, keyboard,
+        () => requests.get(id) === entry, entry.turnId).then(async (message) => {
         if (!Number.isSafeInteger(message?.message_id) || message.message_id <= 0) return;
         entry.messageId = message.message_id;
         messages.set(entry.messageId, { entry, choices, answers: new Map(), count: questions.length });
@@ -100,6 +101,12 @@ export function codexChoices(telegram, label) {
       for (const token of choices.keys()) publications.set(token, published);
       try {
         await published;
+      } catch (error) {
+        if (requests.get(id) === entry) {
+          requests.delete(id);
+          seen.delete(id);
+        }
+        throw error;
       } finally {
         for (const token of choices.keys()) publications.delete(token);
       }
@@ -110,7 +117,7 @@ export function codexChoices(telegram, label) {
       const answer = (text) => telegram.answerCallback(query.id, text).catch(() => {});
       const prompt = messages.get(query.message.message_id);
       if (!prompt) {
-        await answer(unavailable);
+        await answer(buttonState.callbackStatus(query.message.message_id, 'codex') ?? unavailable);
         return true;
       }
       if (prompt.tokens) {
@@ -120,7 +127,8 @@ export function codexChoices(telegram, label) {
       const { entry, choices, answers, count } = prompt;
       const choice = choices.get(query.data);
       if (!choice || entry.status || entry.inFlight) {
-        await answer(choice ? (entry.status ?? 'Ответ уже отправляется в Codex.') : unavailable);
+        await answer(choice ? (entry.status ?? 'Ответ уже отправляется в Codex.')
+          : buttonState.callbackStatus(query.message.message_id, 'codex') ?? unavailable);
         return true;
       }
       if (!await confirmTurn(entry.session, entry.turnId) || requests.get(entry.id) !== entry) {
@@ -139,6 +147,11 @@ export function codexChoices(telegram, label) {
       }
       const inFlight = Promise.withResolvers();
       entry.inFlight = inFlight;
+      if (!await buttonState.begin(entry.messageId).catch(() => false) || requests.get(entry.id) !== entry) {
+        await answer(unknown);
+        await finish(entry, unknown).catch(() => {});
+        return true;
+      }
       const result = { answers: Object.fromEntries([...answers].map(([id, label]) => [id, { answers: [label] }])) };
       let timer;
       const deadline = new Promise((resolve) => { timer = setTimeout(resolve, 1500, false); });
@@ -156,6 +169,12 @@ export function codexChoices(telegram, label) {
       if (entry?.session.id === threadId) return close(entry, true);
     },
     clearThread(threadId) { clear(threadId); },
+    suspend() {
+      for (const entry of requests.values()) entry.inFlight?.resolve(false);
+      requests.clear();
+      seen.clear();
+      messages.clear();
+    },
     finishTurn(threadId, id) { clear(threadId, (turnId) => turnId === id); },
     startTurn(threadId, id) { clear(threadId, (turnId) => turnId !== id); },
   };

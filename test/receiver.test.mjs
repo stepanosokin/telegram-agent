@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict';
 import { execFile, fork } from 'node:child_process';
 import { once } from 'node:events';
-import { chmod, link, mkdir, mkdtemp, readdir, readFile, rm, unlink, writeFile } from 'node:fs/promises';
+import { chmod, link, mkdir, mkdtemp, readdir, readFile, rm, symlink, unlink, writeFile } from 'node:fs/promises';
+import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
@@ -30,6 +31,7 @@ function newText(text, messageId = 30, updateId = 10) {
 async function run(scenario, threads = [primaryThread], restart) {
   const home = await mkdtemp(join(tmpdir(), 'telegram-agent-test-'));
   const profile = join(home, '.telegram');
+  let codexSocket;
   try {
     if (process.platform === 'win32') {
       const script = String.raw`
@@ -65,6 +67,36 @@ exit $LASTEXITCODE
       }
     }
     const openCodeState = join(home, 'state');
+    const codexHome = join(home, 'codex');
+    async function registerCodex(identity) {
+      if (!identity) return;
+      const control = join(codexHome, 'app-server-control');
+      const daemon = join(codexHome, 'app-server-daemon');
+      await mkdir(control, { recursive: true });
+      await mkdir(daemon, { recursive: true });
+      const record = { pid: process.pid, processStartTime: '170000000000000000' };
+      if (process.platform === 'linux') {
+        if (codexSocket && identity !== scenario.codexIdentity) {
+          await new Promise((resolve) => codexSocket.close(resolve));
+          codexSocket = undefined;
+        }
+        if (!codexSocket) {
+          codexSocket = createServer();
+          const physical = join(codexHome, 'local.sock');
+          codexSocket.listen(physical);
+          await once(codexSocket, 'listening');
+          const advertised = join(control, 'app-server-control.sock');
+          await unlink(advertised).catch((error) => { if (error.code !== 'ENOENT') throw error; });
+          await symlink(physical, advertised);
+        }
+        const stat = await readFile('/proc/self/stat', 'utf8');
+        record.processIdentity = {
+          bootId: (await readFile('/proc/sys/kernel/random/boot_id', 'utf8')).trim(),
+          startTicks: Number(stat.slice(stat.lastIndexOf(')') + 2).split(/\s+/)[19]),
+        };
+      }
+      await writeFile(join(daemon, 'daemon.pid'), JSON.stringify(record), { mode: 0o600 });
+    }
     async function registerOpenCode(options) {
       if (!options) return;
       const stateDir = join(openCodeState, 'opencode');
@@ -75,6 +107,7 @@ exit $LASTEXITCODE
       }), { mode: 0o600 });
     }
     await registerOpenCode(scenario.openCode);
+    await registerCodex(scenario.codexIdentity);
     const first = await runReceiver(scenario, threads, home, openCodeState);
     if (scenario.inspectRecovery) {
       const directory = join(profile, 'receiver-text-v1-100-200-300');
@@ -84,8 +117,12 @@ exit $LASTEXITCODE
     }
     if (!restart) return first;
     await registerOpenCode(restart.openCode);
-    return [first, await runReceiver({ firstMessageId: 50, ...restart }, threads, home, openCodeState)];
+    await registerCodex(restart.codexIdentity);
+    const previousPrompt = restart.restoredCallbacks && first.calls.find(({ channel, method, params }) =>
+      channel === 'telegram' && method === 'sendMessage' && params.reply_markup?.inline_keyboard.length);
+    return [first, await runReceiver({ firstMessageId: 50, ...restart, previousPrompt: previousPrompt?.params }, threads, home, openCodeState)];
   } finally {
+    if (codexSocket) await new Promise((resolve) => codexSocket.close(resolve));
     await rm(home, { recursive: true, force: true });
   }
 }
@@ -97,6 +134,7 @@ async function runReceiver(scenario, threads, home, openCodeState) {
       ...process.env,
       HOME: home,
       USERPROFILE: home,
+      CODEX_HOME: join(home, 'codex'),
       XDG_STATE_HOME: openCodeState,
       TELEGRAM_AGENT_SCENARIO: JSON.stringify(scenario),
     },
@@ -493,6 +531,152 @@ const colorForm = {
     options: [{ value: 'blue', label: 'Синий' }, { value: 'green', label: 'Зелёный', description: 'Цвет листвы' }],
   }],
 };
+
+test('восстанавливает открытую форму в исходном сообщении и требует новое нажатие', async () => {
+  const openCode = { sessionID: openCodeSession, title: 'Диалог OpenCode', form: colorForm };
+  const [first, second] = await run({ openCode }, [`opencode:${openCodeSession}`], {
+    openCode, restoredCallbacks: [
+      { old: true, choice: 0 }, { old: true, choice: 2 },
+      { choice: 1 }, { choice: 2 }, { choice: 2 },
+    ],
+  });
+  const initial = callsFor(first, 'telegram', 'sendMessage')[0].params.reply_markup.inline_keyboard;
+  const recovered = callsFor(second, 'telegram', 'editMessageText')[0]?.params;
+  assert.equal(recovered?.message_id, 1);
+  assert.notEqual(recovered.reply_markup.inline_keyboard[0][0].callback_data, initial[0][0].callback_data);
+  assert.match(callsFor(second, 'telegram', 'answerCallbackQuery')[0]?.params.text, /нажмите.*снова/i);
+  const answers = callsFor(second, 'opencode', `POST /api/session/${openCodeSession}/form/${colorForm.id}/reply`);
+  assert.deepEqual(answers.map(({ params }) => params), [{ answer: { color: 'green' } }]);
+});
+
+test('переподписывает Codex на живой запрос разрешения и принимает только новую кнопку', async () => {
+  const codex = { codexChoice: codexApproval, sessions: askingSession, noNewItem: true, codexIdentity: 1 };
+  const [first, second] = await run(codex, [primaryThread], {
+    ...codex, codexReplayDelay: 200, restoredCallbacks: [{ old: true, choice: 0 }, { choice: 1 }, { choice: 1 }],
+  });
+  const initial = callsFor(first, 'telegram', 'sendMessage')[0].params.reply_markup.inline_keyboard;
+  const recovered = callsFor(second, 'telegram', 'editMessageText')[0]?.params;
+  assert.equal(callsFor(second, 'codex', 'thread/resume').length, 1);
+  assert.equal(recovered?.message_id, 1);
+  assert.notEqual(recovered.reply_markup.inline_keyboard[0][0].callback_data, initial[0][0].callback_data);
+  assert.match(callsFor(second, 'telegram', 'answerCallbackQuery')[0]?.params.text, /нажмите.*снова/i);
+  assert.deepEqual(callsFor(second, 'codex', 'serverResponse').map(({ params }) => params),
+    [{ id: codexApproval.id, result: { decision: 'decline' } }]);
+});
+
+for (const disruption of ['503', 'truncated']) {
+  test('после обрыва Telegram переподписывает Codex и заменяет клавиатуру — ' + disruption, async () => {
+    const result = await run({
+      codexChoice: harmlessChoice, sessions: askingSession, noNewItem: true,
+      recoverDuringPoll: disruption, restoredCallbacks: [{ old: true, choice: 0 }, { choice: 1 }, { choice: 1 }],
+    });
+    assert.equal(callsFor(result, 'codex', 'initialize').length, 1);
+    assert.equal(callsFor(result, 'codex', 'thread/resume').length, 2);
+    assert.match(callsFor(result, 'telegram', 'answerCallbackQuery')[0]?.params.text, /нажмите.*снова/i);
+    assert.deepEqual(callsFor(result, 'codex', 'serverResponse').map(({ params }) => params),
+      [{ id: harmlessChoice.id, result: { answers: { color: { answers: ['Зелёный'] } } } }]);
+  });
+}
+
+test('после перезапуска отмечает форму OpenCode, закрытую с компьютера во время обрыва', async () => {
+  const openCode = { sessionID: openCodeSession, title: 'Диалог OpenCode', form: colorForm };
+  const [, second] = await run({ openCode }, ['opencode:' + openCodeSession], {
+    openCode: { ...openCode, initialFormState: { status: 'cancelled' }, formAlreadyOpen: true },
+    restoredCallbacks: [{ old: true, choice: 0 }],
+  });
+  const status = callsFor(second, 'telegram', 'editMessageText').find(({ params }) => params.message_id === 1)?.params;
+  assert.match(status?.text, /запрос закрыт/i);
+  assert.deepEqual(status.reply_markup.inline_keyboard, []);
+  assert.equal(callsFor(second, 'opencode', 'POST /api/session/' + openCodeSession + '/form/' + colorForm.id + '/reply').length, 0);
+});
+
+test('новый App Server Codex с прежним числовым ID не получает ответ по старой кнопке', async () => {
+  const codex = { codexChoice: harmlessChoice, sessions: askingSession, noNewItem: true, codexIdentity: 1 };
+  const [, second] = await run(codex, [primaryThread], {
+    ...codex, codexIdentity: 2, restoredCallbacks: [{ old: true, choice: 0 }, { newMessage: true, choice: 1 }],
+  });
+  const status = callsFor(second, 'telegram', 'editMessageText').find(({ params }) => params.message_id === 1)?.params;
+  assert.match(status?.text, /не подтверждён.*на компьютере/i);
+  assert.deepEqual(status.reply_markup.inline_keyboard, []);
+  assert.ok(callsFor(second, 'telegram', 'sendMessage').some(({ params }) => params.reply_markup?.inline_keyboard.length));
+  assert.deepEqual(callsFor(second, 'codex', 'serverResponse').map(({ params }) => params),
+    [{ id: harmlessChoice.id, result: { answers: { color: { answers: ['Зелёный'] } } } }]);
+});
+
+test('после аварии между ответом и квитанцией исходная кнопка остаётся недоступной', async () => {
+  const codex = { codexChoice: harmlessChoice, sessions: askingSession, noNewItem: true, codexIdentity: 1 };
+  const [first, second] = await run({ ...codex, callbacks: [{ prompt: 0, choice: 0 }], crashAfterResponse: true }, [primaryThread], {
+    ...codex, restoredCallbacks: [{ old: true, choice: 0 }],
+  });
+  assert.equal(first.code, 70);
+  assert.equal(callsFor(first, 'codex', 'serverResponse').length, 1);
+  assert.equal(callsFor(second, 'codex', 'serverResponse').length, 0);
+  const status = callsFor(second, 'telegram', 'editMessageText').find(({ params }) => params.message_id === 1)?.params;
+  assert.match(status?.text, /результат ответа не подтверждён.*на компьютере/i);
+  assert.deepEqual(status.reply_markup.inline_keyboard, []);
+});
+
+test('после перезапуска показывает известное закрытие запроса Codex без повторной отправки', async () => {
+  const codex = { codexChoice: harmlessChoice, sessions: askingSession, noNewItem: true, codexIdentity: 1 };
+  const [, second] = await run(codex, [primaryThread], {
+    ...codex, codexChoice: undefined, sessions: {
+      [primaryThread]: { name: 'Диалог', status: { type: 'active', activeFlags: [] }, turns: askingSession[primaryThread].turns },
+    },
+    restoredCallbacks: [{ old: true, choice: 0 }],
+  });
+  const status = callsFor(second, 'telegram', 'editMessageText').find(({ params }) => params.message_id === 1)?.params;
+  assert.match(status?.text, /запрос закрыт/i);
+  assert.deepEqual(status.reply_markup.inline_keyboard, []);
+  assert.equal(callsFor(second, 'codex', 'serverResponse').length, 0);
+});
+
+test('после разрыва событий OpenCode сверяет формы и разрешения перед следующим ответом', async () => {
+  const openCode = {
+    sessionID: openCodeSession, title: 'Диалог OpenCode', form: colorForm, recoverStream: true,
+  };
+  const result = await run({
+    openCode,
+    restoredCallbacks: [
+      { old: true, choice: 0 },
+      { choice: 0, from: { id: 999, is_bot: false } },
+      { choice: 1 }, { choice: 2 }, { choice: 2 },
+    ],
+  }, ['opencode:' + openCodeSession]);
+  assert.equal(callsFor(result, 'opencode', 'GET /api/event').length, 2);
+  assert.equal(callsFor(result, 'opencode', 'GET /api/session/' + openCodeSession + '/form').length, 2);
+  assert.equal(callsFor(result, 'opencode', 'GET /api/session/' + openCodeSession + '/permission').length, 2);
+  const answers = callsFor(result, 'opencode', 'POST /api/session/' + openCodeSession + '/form/' + colorForm.id + '/reply');
+  assert.deepEqual(answers.map(({ params }) => params), [{ answer: { color: 'green' } }]);
+});
+
+test('сохраняет открытый запрос, если Telegram временно отклонил восстановление его кнопок', async () => {
+  const openCode = { sessionID: openCodeSession, title: 'Диалог OpenCode', form: colorForm, formAlreadyOpen: true };
+  const [, second] = await run({ openCode }, ['opencode:' + openCodeSession], {
+    openCode: { ...openCode, failFirstChoiceEdit: true },
+    restoredCallbacks: [{ old: true, choice: 0 }, { choice: 1 }, { choice: 2 }],
+  });
+  const attempted = callsFor(second, 'telegram', 'editMessageText').filter(({ params }) => params.reply_markup.inline_keyboard.length);
+  const [recovered] = callsFor(second, 'telegram-applied', 'editMessageText');
+  assert.ok(attempted.length >= 2);
+  assert.equal(recovered?.params.message_id, 1);
+  assert.match(recovered?.params.text, /нажмите кнопку снова/i);
+  const answers = callsFor(second, 'opencode', 'POST /api/session/' + openCodeSession + '/form/' + colorForm.id + '/reply');
+  assert.deepEqual(answers.map(({ params }) => params), [{ answer: { color: 'green' } }]);
+});
+
+test('повторяет сверку OpenCode, если список форм временно недоступен после новой подписки', async () => {
+  const result = await run({
+    openCode: {
+      sessionID: openCodeSession, title: 'Диалог OpenCode', form: colorForm,
+      formAlreadyOpen: true, recoverStream: true, failFormListAfterReconnect: true,
+    },
+    restoredCallbacks: [{ old: true, choice: 0 }, { choice: 1 }, { choice: 2 }],
+  }, ['opencode:' + openCodeSession]);
+  assert.equal(callsFor(result, 'opencode', 'GET /api/event').length, 2);
+  assert.equal(callsFor(result, 'opencode', 'GET /api/session/' + openCodeSession + '/form').length, 3);
+  const answers = callsFor(result, 'opencode', 'POST /api/session/' + openCodeSession + '/form/' + colorForm.id + '/reply');
+  assert.deepEqual(answers.map(({ params }) => params), [{ answer: { color: 'green' } }]);
+});
 
 test('отправляет значение выбранного варианта в открытую форму OpenCode 2', async () => {
   const result = await run({

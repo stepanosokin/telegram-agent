@@ -12,7 +12,8 @@ async function localRegistration(file) {
   const entry = JSON.parse(await readFile(file, 'utf8'));
   const url = new URL(entry.url);
   if (!['http:', 'https:'].includes(url.protocol) || !['127.0.0.1', '[::1]'].includes(url.hostname)
-    || url.username || url.password || url.pathname !== '/' || url.search || url.hash) return;
+    || url.username || url.password || url.pathname !== '/' || url.search || url.hash
+    || typeof entry.id !== 'string' || !entry.id || !Number.isSafeInteger(entry.pid) || entry.pid <= 0) return;
   return { origin: url.origin, id: entry.id, pid: entry.pid };
 }
 

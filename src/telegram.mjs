@@ -19,7 +19,7 @@ export function telegramClient(profile, stopSignal) {
       });
       payload = await response.json();
     } catch {
-      throw new TelegramError(response?.status);
+      throw new TelegramError(response?.ok ? undefined : response?.status);
     }
     if (!response.ok || payload?.ok !== true) {
       throw new TelegramError(payload?.error_code || response.status);

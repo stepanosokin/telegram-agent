@@ -6,11 +6,23 @@ import { createRequire, syncBuiltinESMExports } from 'node:module';
 import { connect } from 'node:net';
 import { join } from 'node:path';
 import { PassThrough, Transform } from 'node:stream';
+import { promisify } from 'node:util';
 import { WebSocketServer } from 'ws';
 
 const childProcess = createRequire(import.meta.url)('node:child_process');
 const spawn = childProcess.spawn;
+const execFile = childProcess.execFile;
 const scenario = JSON.parse(process.env.TELEGRAM_AGENT_SCENARIO);
+const inspectProcess = (...args) => execFile(...args);
+inspectProcess[promisify.custom] = (...args) => {
+  const evidence = args[2]?.env;
+  if (scenario.codexIdentity && evidence?.TELEGRAM_AGENT_CODEX_PID && evidence.TELEGRAM_AGENT_CODEX_SOCKET) {
+    const socketTimestamp = 170000000000001000n + BigInt(scenario.codexIdentity);
+    return Promise.resolve({ stdout: ['170000000000000000', socketTimestamp, '0000000000000123'].join('\r\n') });
+  }
+  return execFile[promisify.custom](...args);
+};
+childProcess.execFile = inspectProcess;
 const telegram = {
   bot: { id: 100, is_bot: true },
   chat: { id: 200, type: 'private' },
@@ -28,16 +40,23 @@ let callbackTurnChecks = 0;
 let polls = 0;
 let sentCount = 0;
 const prompts = [];
+let recoveredPrompt;
+const previousPrompt = scenario.previousPrompt && {
+  message: { message_id: 1, chat: telegram.chat, date: 1, from: telegram.bot },
+  choices: scenario.previousPrompt.reply_markup.inline_keyboard.flat(),
+};
 const { promise: codexChoicePublished, resolve: recordCodexChoice } = Promise.withResolvers();
 const { promise: openCodePublished, resolve: recordOpenCodePublish } = Promise.withResolvers();
 const { promise: openCodeViewRead, resolve: recordOpenCodeViewRead } = Promise.withResolvers();
 let openCodePosts = 0;
 let openCodeStream;
+let openCodeDisconnected;
 let openCodeProbes = 0;
 let openCodeSubscriptions = 0;
 let openCodeSecondPublished;
-let openCodeFormState = { status: 'pending' };
+let openCodeFormState = scenario.openCode?.initialFormState ?? { status: 'pending' };
 let openCodeChoiceEdits = 0;
+let failedOpenCodeFormList = false;
 let openCodePermission;
 let emitCodexPacket;
 const openCodeEncoder = new TextEncoder();
@@ -90,6 +109,7 @@ globalThis.fetch = async (url, options) => {
     if (target.pathname === '/api/event') {
       openCodeSubscriptions++;
       const signal = options?.signal ?? (url instanceof Request ? url.signal : undefined);
+      openCodeDisconnected = new Promise((resolve) => signal.addEventListener('abort', resolve, { once: true }));
       const body = new ReadableStream({
         start(controller) {
           openCodeStream = controller;
@@ -123,8 +143,12 @@ globalThis.fetch = async (url, options) => {
       if (!/^msg_/.test(body.id)) return Response.json({ _tag: 'InvalidRequestError', message: 'Expected a string starting with msg_' }, { status: 400 });
       return Response.json({ data: { sessionID, id: body.id } });
     }
-    if (form && target.pathname === `/api/session/${sessionID}/form`) {
-      return Response.json({ data: openCodeFormState.status === 'pending' ? [form] : [] });
+    if (target.pathname === `/api/session/${sessionID}/form`) {
+      if (scenario.openCode.failFormListAfterReconnect && openCodeSubscriptions > 1 && !failedOpenCodeFormList) {
+        failedOpenCodeFormList = true;
+        return new Response(null, { status: 503 });
+      }
+      return Response.json({ data: form && openCodeFormState.status === 'pending' ? [form] : [] });
     }
     if (form && target.pathname === `/api/session/${sessionID}/form/${form.id}`) {
       return Response.json({ data: { ...form, state: openCodeFormState } });
@@ -205,6 +229,11 @@ globalThis.fetch = async (url, options) => {
         }
       }
       record('telegram-applied', method, params);
+      const original = previousPrompt ?? ((scenario.recoverDuringPoll || scenario.openCode?.recoverStream) && prompts[0]);
+      if (original && params.message_id === original.message.message_id
+        && params.reply_markup.inline_keyboard.length && !recoveredPrompt) {
+        recoveredPrompt = { message: original.message, choices: params.reply_markup.inline_keyboard.flat() };
+      }
       result = true;
       break;
     case 'answerCallbackQuery':
@@ -260,6 +289,25 @@ globalThis.fetch = async (url, options) => {
         sendOpenCodeText(scenario.openCode.sessionID, 'Новый ответ после возобновления');
         await promise;
         result = [scenario.openCode.resumedReply];
+      } else if (polls === 2 && scenario.recoverDuringPoll) {
+        if (scenario.recoverDuringPoll === 'truncated') {
+          return new Response('{"ok":', { status: 200 });
+        }
+        return new Response(JSON.stringify({ ok: false, error_code: 503 }), { status: 503 });
+      } else if (polls === 2 && scenario.openCode?.recoverStream) {
+        openCodeStream.close();
+        await openCodeDisconnected;
+        result = [];
+      } else if (scenario.restoredCallbacks
+        && ((scenario.recoverDuringPoll || scenario.openCode?.recoverStream) ? [3, 4].includes(polls) : polls === 2)) {
+        result = scenario.restoredCallbacks.flatMap(({ old, choice, newMessage, ...overrides }, index) => {
+          if ((scenario.recoverDuringPoll || scenario.openCode?.recoverStream) && Boolean(old) !== (polls === 3)) return [];
+          const prompt = old ? previousPrompt ?? prompts[0] : newMessage ? prompts[0] : recoveredPrompt;
+          return [{ update_id: 100 + index, callback_query: {
+            id: `recovery-${index}`, from: { id: 300, is_bot: false },
+            message: prompt?.message, data: prompt?.choices[choice]?.callback_data, ...overrides,
+          } }];
+        });
       } else if (polls === 2 && scenario.callbacks) {
         if (scenario.beforeChoice) emitCodexPacket(scenario.beforeChoice);
         result = scenario.callbacks.map((callback, index) => makeCallback(callback, index));
@@ -337,7 +385,9 @@ childProcess.spawn = (command, args, options) => {
     const { method, id, params, result: clientResult } = JSON.parse(line);
     if (!method && clientResult && scenario.codexChoice) {
       record('codex', 'serverResponse', { id, result: clientResult });
-      if (scenario.disconnectAfterPermissionWrite) {
+      if (scenario.crashAfterResponse) {
+        process.send({ channel: 'fixture', method: 'crash' }, () => process.exit(70));
+      } else if (scenario.disconnectAfterPermissionWrite) {
         queueMicrotask(() => proxy.stdout.end());
       } else if (!scenario.noChoiceResolution) {
         emit({ method: 'serverRequest/resolved', params: { threadId: scenario.codexChoice.params.threadId, requestId: id } });
@@ -350,7 +400,7 @@ childProcess.spawn = (command, args, options) => {
     let result;
     switch (method) {
       case 'initialize':
-        result = {};
+        result = { codexHome: process.env.CODEX_HOME };
         break;
       case 'initialized':
         return;
@@ -420,7 +470,8 @@ childProcess.spawn = (command, args, options) => {
     }
     emit({ id, result });
     if (method === 'thread/resume' && scenario.codexChoice?.params.threadId === threadId) {
-      emit(scenario.codexChoice);
+      if (scenario.codexReplayDelay) setTimeout(() => emit(scenario.codexChoice), scenario.codexReplayDelay);
+      else emit(scenario.codexChoice);
     }
     if (method === 'thread/resume' && session && !scenario.noNewItem && !scenario.withoutItem?.includes(threadId)) {
       const index = threadIds.indexOf(threadId) + 1;

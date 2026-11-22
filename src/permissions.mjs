@@ -46,7 +46,7 @@ export function openCodePermissionDescription(request) {
   return `${action}\nПути:\n${request.resources.map((path) => '• ' + path).join('\n')}`;
 }
 
-export function permissions(telegram, label, bindMessage) {
+export function permissions(telegram, label, bindMessage, buttonState) {
   const requests = new Map();
   const seen = new Set();
   const messages = new Map();
@@ -56,7 +56,8 @@ export function permissions(telegram, label, bindMessage) {
   async function edit(entry, status) {
     if (!entry.messageId || !entry.buttons?.size) return;
     messages.set(entry.messageId, { tokens: new Set(entry.buttons.keys()), status });
-    await telegram.editChoice(entry.messageId, `${entry.body}\n\n${status}`).catch(() => {});
+    await buttonState.complete(entry.messageId, status === closed ? 'closed' : status === unknown ? 'unknown' : 'sent',
+      () => telegram.editChoice(entry.messageId, `${entry.body}\n\n${status}`).then(() => true, () => false));
   }
 
   function settle(entry, status) {
@@ -73,7 +74,7 @@ export function permissions(telegram, label, bindMessage) {
   }
 
   return {
-    async publish({ session, id, turnId = undefined, details, confirm, respond = undefined }) {
+    async publish({ session, id, turnId = undefined, details, confirm, respond = undefined, context = undefined }) {
       const key = keyFor(session.key, id);
       if (seen.has(key)) return;
       seen.add(key);
@@ -83,7 +84,14 @@ export function permissions(telegram, label, bindMessage) {
         status: undefined, sending: false, messageId: undefined, buttons: new Map(), confirm, respond };
       requests.set(key, entry);
       const isOpen = () => !entry.status && requests.get(key) === entry;
-      if (!await confirm(isOpen) || !isOpen()) {
+      const confirmed = await confirm(isOpen).catch((error) => {
+        if (requests.get(key) === entry) {
+          requests.delete(key);
+          seen.delete(key);
+        }
+        throw error;
+      });
+      if (!confirmed || !isOpen()) {
         if (requests.get(key) === entry) {
           requests.delete(key);
           if (!respond) seen.delete(key);
@@ -103,19 +111,25 @@ export function permissions(telegram, label, bindMessage) {
       }
       const keyboard = [...entry.buttons].map(([callback_data, { action }]) =>
         [{ text: labels[action], callback_data }]);
-      const published = telegram.send(body, { keyboard }).then(async (message) => {
+      const published = buttonState.publish('permission', session, id, context, body, keyboard, isOpen, turnId).then(async (message) => {
         if (!Number.isSafeInteger(message?.message_id) || message.message_id <= 0) return;
-        await bindMessage(session, message);
         entry.messageId = message.message_id;
+        if (!isOpen()) {
+          if (entry.status) await edit(entry, entry.status);
+          return;
+        }
         messages.set(entry.messageId, { entry });
-        if (entry.status) await edit(entry, entry.status);
+        await bindMessage(session, message).catch(() => console.error('Не удалось сохранить привязку сообщения Codex.'));
       });
       for (const token of entry.buttons.keys()) publications.set(token, published);
       try {
         await published;
+      } catch (error) {
+        if (requests.get(key) === entry) seen.delete(key);
+        throw error;
       } finally {
         for (const token of entry.buttons.keys()) publications.delete(token);
-        if (!entry.messageId) requests.delete(key);
+        if (!entry.messageId && requests.get(key) === entry) requests.delete(key);
       }
     },
     async handle(query) {
@@ -126,7 +140,8 @@ export function permissions(telegram, label, bindMessage) {
       const entry = prompt?.entry;
       const choice = entry?.buttons.get(query.data);
       if (!choice) {
-        await answer(prompt?.tokens?.has(query.data) ? prompt.status : unavailable);
+        await answer(prompt?.tokens?.has(query.data) ? prompt.status
+          : buttonState.callbackStatus(query.message.message_id, 'permission') ?? unavailable);
         return true;
       }
       const isOpen = () => !entry.status && requests.get(entry.key) === entry;
@@ -135,6 +150,11 @@ export function permissions(telegram, label, bindMessage) {
         return true;
       }
       entry.sending = true;
+      if (!await buttonState.begin(entry.messageId).catch(() => false) || !isOpen()) {
+        await settle(entry, unknown).catch(() => {});
+        await answer(unknown);
+        return true;
+      }
       const result = await entry.respond(choice.value, entry.finishSignal.promise).catch(() => 'unknown');
       const status = result === 'sent'
         ? 'Решение отправлено, Codex закрыл запрос. Итог виден в исходной сессии.' : unknown;
@@ -148,6 +168,19 @@ export function permissions(telegram, label, bindMessage) {
     },
     forgetNotification(sessionKey, id) {
       seen.delete(keyFor(sessionKey, id));
+    },
+    suspend(agent) {
+      for (const entry of requests.values()) {
+        if (entry.session.agent !== agent) continue;
+        entry.finishSignal.resolve(false);
+        requests.delete(entry.key);
+      }
+      for (const key of seen) {
+        if (key.startsWith('["' + agent + ':')) seen.delete(key);
+      }
+      for (const [id, prompt] of messages) {
+        if (prompt.entry?.session.agent === agent) messages.delete(id);
+      }
     },
     /** @param {{matches?: (turnId: string | undefined) => boolean, disconnected?: boolean}} [options] */
     clear(agent, sessionId, options = {}) {

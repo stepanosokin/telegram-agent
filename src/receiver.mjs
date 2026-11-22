@@ -1,5 +1,7 @@
 import { randomUUID } from 'node:crypto';
+import { setTimeout as delay } from 'node:timers/promises';
 import { isDeepStrictEqual } from 'node:util';
+import { openButtonState } from './button-state.mjs';
 import { openAppServer } from './codex.mjs';
 import { codexChoices } from './codex-choices.mjs';
 import { openCodeForms } from './opencode-forms.mjs';
@@ -48,18 +50,20 @@ function* withHeader(header, text) {
   }
 }
 
-async function runReceiver(telegram, profile, textState, threadIds, openCodeIds, stopSignal) {
+async function runReceiver(telegram, profile, textState, buttonState, threadIds, openCodeIds, stopSignal) {
   const sessions = new Map();
   const drafts = new Map();
+  const codexKeys = new Set([...threadIds].map((id) => 'Codex:' + id));
+  const openCodeKeys = new Set([...openCodeIds].map((id) => 'OpenCode:' + id));
   const defaultAgent = !openCodeIds.size ? 'Codex' : !threadIds.size ? 'OpenCode' : undefined;
   let outgoing = Promise.resolve();
-  const choices = codexChoices(telegram, (session) => sessionLabel(session, 160));
-  const forms = openCodeForms(telegram, (session) => sessionLabel(session, 160));
-  const approvals = permissions(telegram, (session) => sessionLabel(session, 160), bindMessage);
+  const choices = codexChoices(telegram, (session) => sessionLabel(session, 160), buttonState);
+  const forms = openCodeForms(telegram, (session) => sessionLabel(session, 160), buttonState);
+  const approvals = permissions(telegram, (session) => sessionLabel(session, 160), bindMessage, buttonState);
 
   async function bindMessage(session, published) {
     if (sessions.get(session.key) === session && Number.isSafeInteger(published?.message_id) && published.message_id > 0) {
-      await textState.bind(published.message_id, session.key, session.serverInstance);
+      await textState.bind(published.message_id, session.key, session.agent === 'OpenCode' ? session.serverInstance : undefined);
       session.confirmed = true;
     }
   }
@@ -72,13 +76,17 @@ async function runReceiver(telegram, profile, textState, threadIds, openCodeIds,
     }
   }
 
-  /** @type {ReturnType<typeof openAppServer> | undefined} */
+  /** @type {Awaited<ReturnType<typeof openAppServer>> | undefined} */
   let codex;
+  let codexInterrupted = false;
+  let codexPublicationPending = false;
   function onCodexEvent(method, event, requestId) {
     const key = `Codex:${event?.threadId}`;
     if (method === 'serverRequest/resolved') {
       void choices.resolve(event?.threadId, event?.requestId);
       approvals.resolve(key, event?.requestId);
+      const instance = codex?.instance;
+      if (instance) outgoing = outgoing.then(() => buttonState.resolved(key, instance, event?.requestId));
     }
     const session = sessions.get(key);
     if (!session) return;
@@ -100,16 +108,24 @@ async function runReceiver(telegram, profile, textState, threadIds, openCodeIds,
     }
     if (requestId !== undefined) {
       if (method === 'item/tool/requestUserInput') {
-        void choices.publish(session, requestId, event, confirmCodexTurn)
-          .catch(() => console.error('Не удалось опубликовать запрос выбора Codex в Telegram.'));
+        const publication = choices.publish(session, requestId, event, confirmCodexTurn)
+          .catch(() => {
+            codexPublicationPending = true;
+            console.error('Не удалось опубликовать запрос выбора Codex в Telegram.');
+          });
+        outgoing = Promise.all([outgoing, publication]).then(() => {});
       } else if (typeof event.turnId === 'string' && event.turnId) {
+        const connection = codex;
         const publication = approvals.publish({
           session, id: requestId, turnId: event.turnId,
-          details: codexPermission(method, event),
+          details: codexPermission(method, event), context: [method, event],
           confirm: () => confirmCodexTurn(session, event.turnId),
-          respond: (decision, resolved) => codex.respondPermission(requestId, decision, resolved),
+          respond: (decision, resolved) => connection.respondPermission(requestId, decision, resolved),
         })
-          .catch(() => console.error('Не удалось опубликовать запрос разрешения Codex в Telegram.'));
+          .catch(() => {
+            codexPublicationPending = true;
+            console.error('Не удалось опубликовать запрос разрешения Codex в Telegram.');
+          });
         outgoing = Promise.all([outgoing, publication]).then(() => {});
       }
       return;
@@ -129,20 +145,27 @@ async function runReceiver(telegram, profile, textState, threadIds, openCodeIds,
 
   function clearCodexSessions() {
     codex = undefined;
-    choices.clearThread(undefined);
-    approvals.clear('Codex', undefined, { disconnected: true });
+    suspendCodexButtons();
     for (const [key, session] of sessions) {
       if (session.agent === 'Codex') sessions.delete(key);
     }
   }
 
+  function suspendCodexButtons() {
+    codexInterrupted = threadIds.size > 0;
+    choices.suspend();
+    approvals.suspend('Codex');
+    buttonState.suspend('Codex');
+  }
+
   async function confirmCodexTurn(session, turnId) {
+    const connection = codex;
     try {
       // A replay on subscription supplies the current request, but the turn also needs to be live.
       await Promise.resolve();
-      if (!await session.ready || !await codex.isLoaded(session.id)) return false;
-      return await codex.activeTurnId(session.id) === turnId
-        && !stopSignal.aborted && sessions.get(session.key) === session;
+      if (!connection || !await session.ready || !await connection.isLoaded(session.id)) return false;
+      return await connection.activeTurnId(session.id) === turnId
+        && codex === connection && !stopSignal.aborted && sessions.get(session.key) === session;
     } catch {
       return false;
     }
@@ -152,15 +175,23 @@ async function runReceiver(telegram, profile, textState, threadIds, openCodeIds,
   let openCode;
   let openCodeReady;
   let openCodeGeneration;
+  let openCodeInterrupted = false;
+  let openCodeSnapshotPending = false;
   const openCodeRevisions = new Map();
   function clearOpenCodeSessions() {
     openCodeGeneration = undefined;
     openCode = undefined;
-    forms.close();
-    approvals.clear('OpenCode', undefined, { disconnected: true });
+    suspendOpenCodeButtons();
     for (const [key, session] of sessions) {
       if (session.agent === 'OpenCode') sessions.delete(key);
     }
+  }
+
+  function suspendOpenCodeButtons() {
+    openCodeInterrupted = openCodeIds.size > 0;
+    forms.suspend();
+    approvals.suspend('OpenCode');
+    buttonState.suspend('OpenCode');
   }
 
   function onOpenCodeEvent(event) {
@@ -213,7 +244,10 @@ async function runReceiver(telegram, profile, textState, threadIds, openCodeIds,
       if (session && event.type === 'session.text.ended' && typeof event.data.text === 'string') {
         await publish(session, event.data.text);
       }
-    }).catch(() => console.error('Не удалось опубликовать сообщение OpenCode в Telegram.'));
+    }).catch(() => {
+      if (event.type === 'form.created' || event.type === 'permission.asked') openCodeSnapshotPending = true;
+      console.error('Не удалось опубликовать сообщение OpenCode в Telegram.');
+    });
   }
 
   async function publishOpenCodePermission(connection, session, request) {
@@ -225,17 +259,23 @@ async function runReceiver(telegram, profile, textState, threadIds, openCodeIds,
     await approvals.publish({
       session, id: requestId, details: { description: openCodePermissionDescription(request) },
       confirm: async (isOpen) => {
-        const current = await connection.readPermission(id, requestId).catch(() => undefined);
+        const current = await connection.readPermission(id, requestId).catch((error) => {
+          if (!['PermissionNotFoundError', 'SessionNotFoundError'].includes(error?.name)) throw error;
+        });
         return connected() && isOpen() && isDeepStrictEqual(current, request);
       },
     });
   }
 
-  async function confirmOpenCodeSession(connection, id, revision, { verifyReplyable = false, requireActive = false } = {}) {
+  async function confirmOpenCodeSession(connection, id, revision, {
+    verifyReplyable = false, requireActive = false, retrySnapshot = false,
+  } = {}) {
     const key = `OpenCode:${id}`;
     // Viewing a dialog can load history without taking ownership of a running turn.
     const lookup = verifyReplyable ? connection.readReplyableSession(id, requireActive) : connection.read(id);
-    const data = await lookup.catch(() => undefined);
+    const data = await lookup.catch((error) => {
+      if (retrySnapshot && error?.name !== 'SessionNotFoundError') openCodeSnapshotPending = true;
+    });
     if (openCode !== connection || openCodeRevisions.get(key) !== revision) return;
     if (data?.id !== id || !data.time || data.time.archived !== undefined) {
       const session = sessions.get(key);
@@ -370,7 +410,7 @@ async function runReceiver(telegram, profile, textState, threadIds, openCodeIds,
   async function connectCodex() {
     if (codex) return codex;
     if (!threadIds.size || stopSignal.aborted) return;
-    const connection = openAppServer(onCodexEvent, clearCodexSessions);
+    const connection = await openAppServer(onCodexEvent, clearCodexSessions);
     codex = connection;
     try {
       await connection.initialize();
@@ -385,10 +425,11 @@ async function runReceiver(telegram, profile, textState, threadIds, openCodeIds,
     if (!connection || !await connection.isLoaded(threadId)) return;
     const thread = await connection.read(threadId);
     if (!isLiveThread(thread, threadId) || codex !== connection) return;
-    const session = {
+    const key = 'Codex:' + threadId;
+    const session = sessions.get(key) ?? {
       agent: 'Codex', key: `Codex:${threadId}`, id: threadId,
       name: typeof thread.name === 'string' ? thread.name : '',
-      suffix: sessionSuffix(threadId, threadIds), ready: null, confirmed: false,
+      suffix: sessionSuffix(threadId, threadIds), ready: null, confirmed: false, serverInstance: connection.instance,
     };
     sessions.set(session.key, session);
     // Resume can hydrate history if the thread was unloaded after the check.
@@ -420,23 +461,26 @@ async function runReceiver(telegram, profile, textState, threadIds, openCodeIds,
     return openCodeReady;
   }
 
-  try {
-    const sessionKeys = new Set([
-      ...[...threadIds].map((id) => `Codex:${id}`),
-      ...[...openCodeIds].map((id) => `OpenCode:${id}`),
-    ]);
-    const mayRestore = await textState.hasBinding(sessionKeys);
-    const openCodeStarting = connectOpenCode();
-    const codexReady = (async () => {
+  async function subscribeCodex() {
+    codexInterrupted = false;
+    codexPublicationPending = false;
+    try {
       const connection = await connectCodex();
       for (const threadId of threadIds) await attachCodexSession(connection, threadId);
-    })();
-    if (openCodeIds.size || mayRestore) {
-      await codexReady.catch(() => {});
-    } else {
-      await codexReady;
+    } catch (error) {
+      codexInterrupted = threadIds.size > 0;
+      throw error;
     }
-    const openCodeStartingConnection = await openCodeStarting;
+  }
+
+  async function subscribeOpenCode() {
+    openCodeInterrupted = false;
+    openCodeSnapshotPending = false;
+    const openCodeStartingConnection = await connectOpenCode();
+    if (!openCodeStartingConnection) {
+      openCodeInterrupted = openCodeIds.size > 0;
+      return;
+    }
     const active = await openCodeStartingConnection?.active().catch(() => undefined);
     for (const id of openCodeIds) {
       if (active?.[id]?.type === 'running') {
@@ -444,25 +488,102 @@ async function runReceiver(telegram, profile, textState, threadIds, openCodeIds,
       }
       const key = `OpenCode:${id}`;
       const revision = openCodeRevisions.get(key);
-      const pending = await openCodeStartingConnection?.pendingForms(id).catch(() => undefined);
-      const pendingApprovals = await openCodeStartingConnection?.pendingPermissions(id).catch(() => undefined);
+      const readPending = (read) => read(id).catch(() => {
+        openCodeSnapshotPending = true;
+      });
+      const [pending, pendingApprovals] = await Promise.all([
+        readPending(openCodeStartingConnection.pendingForms),
+        readPending(openCodeStartingConnection.pendingPermissions),
+      ]);
+      if (!pending || !pendingApprovals) openCodeSnapshotPending = true;
       if (!pending?.length && !pendingApprovals?.length) continue;
-      const session = await confirmOpenCodeSession(openCodeStartingConnection, id, revision);
+      const session = await confirmOpenCodeSession(openCodeStartingConnection, id, revision, { retrySnapshot: true });
       if (session) {
         for (const form of pending ?? []) {
           if (form.sessionID !== id) continue;
           await forms.publish(session, form.id, openCodeStartingConnection, () =>
             openCode === openCodeStartingConnection && !stopSignal.aborted && sessions.get(key) === session)
-            .catch(() => console.error('Не удалось опубликовать форму OpenCode в Telegram.'));
+            .catch(() => {
+              openCodeSnapshotPending = true;
+              console.error('Не удалось опубликовать форму OpenCode в Telegram.');
+            });
         }
         for (const request of pendingApprovals ?? []) {
           if (request.sessionID !== id) continue;
           outgoing = outgoing.then(() => publishOpenCodePermission(openCodeStartingConnection, session, request))
-            .catch(() => console.error('Не удалось опубликовать запрос разрешения OpenCode в Telegram.'));
+            .catch(() => {
+              openCodeSnapshotPending = true;
+              console.error('Не удалось опубликовать запрос разрешения OpenCode в Telegram.');
+            });
           await outgoing;
         }
       }
     }
+  }
+
+  async function reconcileButtons(keys) {
+    await outgoing;
+    return buttonState.reconcile(keys, async ({ kind, sessionKey, instance, requestId, turnId }) => {
+      const sessionId = sessionKey.slice(sessionKey.indexOf(':') + 1);
+      if (kind === 'form') {
+        const connection = openCode;
+        if (!connection) return;
+        if (connection.instance !== instance) return 'unavailable';
+        const form = await connection.readForm(sessionId, requestId).catch((error) => {
+          if (!['FormNotFoundError', 'SessionNotFoundError'].includes(error?.name)) openCodeSnapshotPending = true;
+          return undefined;
+        });
+        if (openCode !== connection || form?.sessionID !== sessionId || form?.id !== requestId) return;
+        if (['answered', 'cancelled'].includes(form.state?.status)) return 'closed';
+        if (form.state?.status === 'pending') return null;
+        return;
+      }
+      const connection = codex;
+      if (!connection) return;
+      if (connection.instance !== instance) return 'unavailable';
+      const session = sessions.get(sessionKey);
+      if (!await session?.ready || !await connection.isLoaded(sessionId).catch(() => false)) return;
+      const thread = await connection.read(sessionId).catch(() => undefined);
+      if (codex !== connection || !isLiveThread(thread, sessionId)) return;
+      if (thread.status.type === 'idle') return 'closed';
+      const flag = kind === 'codex' ? 'waitingOnUserInput' : 'waitingOnApproval';
+      if (Array.isArray(thread.status.activeFlags) && !thread.status.activeFlags.includes(flag)) return 'closed';
+      const activeTurn = await connection.activeTurnId(sessionId).catch(() => undefined);
+      if (codex === connection && activeTurn && turnId && activeTurn !== turnId) return 'closed';
+      // A resume response can precede the replay of still-open requests.
+      return null;
+    });
+  }
+
+  async function recoverButtons() {
+    const recoverCodex = codexInterrupted || codexPublicationPending;
+    const recoverOpenCode = openCodeInterrupted || openCodeSnapshotPending;
+    if (!recoverCodex && !recoverOpenCode) {
+      if (buttonState.hasUndisplayedStatus()) await reconcileButtons(new Set([...codexKeys, ...openCodeKeys]));
+      return;
+    }
+    const restarting = [];
+    if (recoverCodex) {
+      if (codexInterrupted) suspendCodexButtons();
+      restarting.push(subscribeCodex().catch(() => {}));
+    }
+    if (recoverOpenCode) {
+      if (openCodeInterrupted) suspendOpenCodeButtons();
+      restarting.push(subscribeOpenCode());
+    }
+    await Promise.all(restarting);
+    await reconcileButtons(new Set([
+      ...(recoverCodex ? codexKeys : []), ...(recoverOpenCode ? openCodeKeys : []),
+    ]));
+  }
+
+  try {
+    const sessionKeys = new Set([...codexKeys, ...openCodeKeys]);
+    const mayRestore = buttonState.hasBinding(sessionKeys) || await textState.hasBinding(sessionKeys);
+    const openCodeStarting = subscribeOpenCode();
+    const codexReady = subscribeCodex();
+    await Promise.all([openCodeStarting, openCodeIds.size || mayRestore ? codexReady.catch(() => {}) : codexReady]);
+    await reconcileButtons(sessionKeys);
     if (!sessions.size && !openCode && !mayRestore) {
       const reason = openCodeIds.size
         ? 'Ни один сервер не подтвердил подключение указанных сессий.'
@@ -473,9 +594,24 @@ async function runReceiver(telegram, profile, textState, threadIds, openCodeIds,
 
     console.log('Приём Telegram запущен.');
     let offset;
+    let retryDelay = 500;
     while (!stopSignal.aborted) {
-      const updates = await telegram.updates(offset);
+      let updates;
+      try {
+        updates = await telegram.updates(offset);
+        retryDelay = 500;
+      } catch (error) {
+        if (stopSignal.aborted) return 0;
+        if (!(error instanceof TelegramError)
+          || (error.code !== undefined && error.code !== 429 && error.code < 500)) throw error;
+        suspendCodexButtons();
+        suspendOpenCodeButtons();
+        await delay(retryDelay, undefined, { signal: stopSignal });
+        retryDelay = Math.min(retryDelay * 2, 15000);
+        continue;
+      }
       if (!Array.isArray(updates)) throw new TelegramError();
+      await recoverButtons();
       for (const update of updates) {
         if (stopSignal.aborted) return 0;
         if (!Number.isSafeInteger(update?.update_id) || update.update_id < 0 || update.update_id < offset) continue;
@@ -483,7 +619,8 @@ async function runReceiver(telegram, profile, textState, threadIds, openCodeIds,
         if (update.callback_query) {
           if (!isOwnerCallback(update.callback_query, profile)) continue;
           if (await approvals.handle(update.callback_query)) continue;
-          if (await choices.handle(update.callback_query, confirmCodexTurn, (id, result) => codex.respond(id, result))) continue;
+          const connection = codex;
+          if (await choices.handle(update.callback_query, confirmCodexTurn, (id, result) => connection.respond(id, result))) continue;
           if (await forms.handle(update.callback_query)) continue;
           await chooseSession(update.callback_query);
           continue;
@@ -541,15 +678,17 @@ async function main(args) {
       return 1;
     }
     let textState;
+    let buttonState;
     try {
       textState = await openTextState(profile);
+      buttonState = await openButtonState(profile, telegram);
     } catch {
       console.error('Приём выключен. Проверьте каталог и права доступа к состоянию восстановления в ~/.telegram.');
       return 1;
     }
     const threadIds = new Set(ids.filter((id) => codexId.test(id)).map((id) => id.toLowerCase()));
     const openCodeIds = new Set(ids.filter((id) => openCodeId.test(id)).map((id) => id.slice('opencode:'.length)));
-    return await runReceiver(telegram, profile, textState, threadIds, openCodeIds, stop.signal);
+    return await runReceiver(telegram, profile, textState, buttonState, threadIds, openCodeIds, stop.signal);
   } catch (error) {
     if (stop.signal.aborted) return 0;
     const reason = error instanceof TelegramError

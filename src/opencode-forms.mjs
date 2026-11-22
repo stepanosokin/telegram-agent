@@ -62,7 +62,7 @@ function hasCompleteAnswer({ fields, answers }) {
   });
 }
 
-export function openCodeForms(telegram, label) {
+export function openCodeForms(telegram, label, buttonState) {
   const requests = new Map();
   const messages = new Map();
   const publications = new Map();
@@ -90,7 +90,8 @@ export function openCodeForms(telegram, label) {
     messages.set(entry.messageId, { status, tokens: new Set(entry.tokens.keys()) });
     const summary = `${entry.header}\n\n${status}`;
     const text = summary.length + details.length <= 4096 ? summary + details : summary;
-    await edit(entry, text, [], 'Telegram не подтвердил обновление формы OpenCode.');
+    await buttonState.complete(entry.messageId, status === accepted ? 'accepted' : status === unknown ? 'unknown' : 'closed',
+      () => edit(entry, text, [], 'Telegram не подтвердил обновление формы OpenCode.'));
   }
 
   return {
@@ -98,7 +99,9 @@ export function openCodeForms(telegram, label) {
       if (typeof formId !== 'string' || !formId) return;
       const key = requestKey(session.id, formId);
       if (requests.has(key) || settled.has(key)) return;
-      const current = await connection.readForm(session.id, formId).catch(() => undefined);
+      const current = await connection.readForm(session.id, formId).catch((error) => {
+        if (!['FormNotFoundError', 'SessionNotFoundError'].includes(error?.name)) throw error;
+      });
       if (!confirmSession() || current?.id !== formId || current.sessionID !== session.id
         || current.state?.status !== 'pending' || requests.has(key) || settled.has(key)) return;
       const header = `${label(session)}\n\n${current.title}`;
@@ -127,7 +130,8 @@ export function openCodeForms(telegram, label) {
         edits: Promise.resolve(true), displayConfirmed: true,
       };
       requests.set(key, entry);
-      const published = telegram.send(text, { keyboard: formKeyboard(entry) }).then(async (message) => {
+      const published = buttonState.publish('form', session, formId, current, text, formKeyboard(entry),
+        () => confirmSession() && requests.get(key) === entry && !entry.closed).then(async (message) => {
         if (!Number.isSafeInteger(message?.message_id) || message.message_id <= 0) return;
         entry.messageId = message.message_id;
         messages.set(entry.messageId, { entry });
@@ -137,7 +141,7 @@ export function openCodeForms(telegram, label) {
       try {
         await published;
       } catch (error) {
-        requests.delete(key);
+        if (requests.get(key) === entry) requests.delete(key);
         throw error;
       } finally {
         for (const token of tokens.keys()) publications.delete(token);
@@ -149,12 +153,12 @@ export function openCodeForms(telegram, label) {
       const answer = (text) => telegram.answerCallback(query.id, text).catch(() => {});
       const prompt = messages.get(query.message.message_id);
       if (!prompt?.entry) {
-        await answer(prompt?.tokens.has(query.data) ? prompt.status : closed);
+        await answer(prompt?.tokens.has(query.data) ? prompt.status : buttonState.callbackStatus(query.message.message_id, 'form') ?? closed);
         return true;
       }
       const { entry } = prompt;
       if (!entry.tokens.has(query.data)) {
-        await answer(closed);
+        await answer(buttonState.callbackStatus(query.message.message_id, 'form') ?? closed);
         return true;
       }
       const isOpen = () => !entry.closed && entry.confirmSession() && requests.get(entry.key) === entry;
@@ -193,6 +197,11 @@ export function openCodeForms(telegram, label) {
         return true;
       }
       entry.inFlight = true;
+      if (!await buttonState.begin(entry.messageId).catch(() => false)) {
+        await finish(entry, unknown).catch(() => {});
+        await answer(unknown);
+        return true;
+      }
       const result = await entry.connection.replyForm(entry.session.id, entry.formId, Object.fromEntries(entry.answers), isOpen);
       const status = result === 'accepted' ? accepted : result === 'closed' ? closed : unknown;
       const details = entry.fields.flatMap((field) => {
@@ -214,6 +223,12 @@ export function openCodeForms(telegram, label) {
           if (!entry.inFlight) void finish(entry, closed);
         }
       }
+    },
+    suspend() {
+      for (const entry of requests.values()) entry.closed = true;
+      requests.clear();
+      messages.clear();
+      settled.clear();
     },
   };
 }
