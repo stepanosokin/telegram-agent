@@ -150,7 +150,11 @@ async function runReceiver(telegram, profile, threadIds, openCodeIds, stopSignal
     if (!openCodeIds.has(id)) return;
     const key = `OpenCode:${id}`;
     if (event.type === 'permission.replied') {
-      approvals.resolve(key, event.data.requestID);
+      const { requestID } = event.data;
+      approvals.resolve(key, requestID);
+      // Clear the old notification after publications queued before this event.
+      // OpenCode can open a distinct request with the same ID afterwards.
+      outgoing = outgoing.then(() => approvals.forgetNotification(key, requestID));
       return;
     }
     if (event.type === 'form.replied' || event.type === 'form.cancelled') {
@@ -358,8 +362,9 @@ async function runReceiver(telegram, profile, threadIds, openCodeIds, stopSignal
         }
         for (const request of pendingApprovals ?? []) {
           if (request.sessionID !== id) continue;
-          await publishOpenCodePermission(openCode, session, request)
+          outgoing = outgoing.then(() => publishOpenCodePermission(openCode, session, request))
             .catch(() => console.error('Не удалось опубликовать запрос разрешения OpenCode в Telegram.'));
+          await outgoing;
         }
       }
     }

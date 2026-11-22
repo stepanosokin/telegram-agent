@@ -139,6 +139,13 @@ const openCodeApproval = {
   save: ['/fixture/*'], source: { type: 'tool', messageID: 'msg_fixture', id: 'tool-fixture' },
 };
 
+test('прекращает запуск, если proxy Codex не завершает рукопожатие', async () => {
+  const result = await run({ codexHandshakeStalls: true });
+  assert.equal(result.code, 1);
+  assert.match(result.stderr, /ошибка связи с общим App Server Codex/i);
+  assert.deepEqual(callsFor(result, 'telegram', 'getUpdates'), []);
+});
+
 test('однократно передаёт разовое разрешение Codex в исходный запрос', async () => {
   const reason = 'Показать тестовое сообщение в терминале';
   const result = await run({
@@ -286,6 +293,20 @@ test('показывает уведомление для разрешения Op
   assert.equal(message.params.reply_markup, undefined);
 });
 
+test('показывает новый запрос OpenCode после закрытия предыдущего с тем же ID', async () => {
+  const result = await run({
+    openCode: {
+      sessionID: openCodeSession, title: 'Диалог OpenCode', permission: openCodeApproval,
+      replacePermission: { ...openCodeApproval, resources: ['/fixture/replacement.txt'] },
+    },
+  }, [`opencode:${openCodeSession}`]);
+  const notices = callsFor(result, 'telegram', 'sendMessage');
+  assert.equal(notices.length, 2);
+  assert.match(notices[0].params.text, /example\.txt/);
+  assert.match(notices[1].params.text, /replacement\.txt/);
+  assert.ok(notices.every(({ params }) => params.reply_markup === undefined));
+});
+
 test('не публикует запрос OpenCode, если тот же ID уже указывает на иной контекст', async () => {
   const result = await run({
     openCode: {
@@ -303,7 +324,7 @@ test('разрешение OpenCode с необозначенными путям
     },
   }, [`opencode:${openCodeSession}`]);
   const [message] = callsFor(result, 'telegram', 'sendMessage');
-  assert.match(message?.params.text, /OpenCode.*Диалог OpenCode[\s\S]*ответ на компьютере/);
+  assert.match(message?.params.text, /OpenCode.*Диалог OpenCode[\s\S]*Действие: read[\s\S]*ответ на компьютере/);
   assert.equal(message.params.reply_markup, undefined);
 });
 
@@ -674,12 +695,12 @@ test('различает OpenCode и Codex с одинаковым назван�
     sessions: { [primaryThread]: { name: 'Общее название', status: { type: 'idle' } } },
     openCode: { sessionID: openCodeSession, title: 'Общее название', text: 'Ответ OpenCode' },
     updates: [newText('Текст только OpenCode')],
-    callbacks: [{ prompt: 0, choice: 1 }],
+    callbacks: [{ prompt: 0, choiceLabel: 'OpenCode ·' }],
   }, [primaryThread, `opencode:${openCodeSession}`]);
   const prompt = callsFor(result, 'telegram', 'sendMessage')
     .find(({ params }) => params.reply_parameters?.message_id === 30);
   const labels = prompt.params.reply_markup.inline_keyboard.flat().map(({ text }) => text);
-  assert.deepEqual(labels.map((label) => label.split(' · ')[0]), ['Codex', 'OpenCode']);
+  assert.deepEqual(labels.map((label) => label.split(' · ')[0]).sort(), ['Codex', 'OpenCode']);
   assert.equal(callsFor(result, 'codex', 'thread/queue/add').length, 0);
   const [sent] = callsFor(result, 'opencode', `POST /api/session/${openCodeSession}/prompt`);
   assert.equal(sent.params.text, 'Текст только OpenCode');

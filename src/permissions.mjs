@@ -38,10 +38,12 @@ export function codexPermission(method, params) {
 }
 
 export function openCodePermissionDescription(request) {
+  if (!displayable(request.action)) return;
+  const action = `Действие: ${request.action}`;
   if (!['read', 'edit', 'write'].includes(request.action) || !Array.isArray(request.resources)
     || !request.resources.length || !request.resources.every((resource) =>
-      absolutePath(resource) && !/[*?\[\]{}]/.test(resource))) return;
-  return `Действие: ${request.action}\nПути:\n${request.resources.map((path) => '• ' + path).join('\n')}`;
+      absolutePath(resource) && !/[*?\[\]{}]/.test(resource))) return action;
+  return `${action}\nПути:\n${request.resources.map((path) => '• ' + path).join('\n')}`;
 }
 
 export function permissions(telegram, label, bindMessage) {
@@ -82,7 +84,10 @@ export function permissions(telegram, label, bindMessage) {
       requests.set(key, entry);
       const isOpen = () => !entry.status && requests.get(key) === entry;
       if (!await confirm(isOpen) || !isOpen()) {
-        requests.delete(key);
+        if (requests.get(key) === entry) {
+          requests.delete(key);
+          if (!respond) seen.delete(key);
+        }
         return;
       }
       if (respond && details?.actions && body.length <= 3800) {
@@ -140,6 +145,9 @@ export function permissions(telegram, label, bindMessage) {
     resolve(sessionKey, id) {
       const entry = requests.get(keyFor(sessionKey, id));
       if (entry) close(entry);
+    },
+    forgetNotification(sessionKey, id) {
+      seen.delete(keyFor(sessionKey, id));
     },
     /** @param {{matches?: (turnId: string | undefined) => boolean, disconnected?: boolean}} [options] */
     clear(agent, sessionId, options = {}) {

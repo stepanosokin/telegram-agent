@@ -1,7 +1,8 @@
 import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { createInterface } from 'node:readline';
+import { Duplex } from 'node:stream';
 import { setTimeout as delay } from 'node:timers/promises';
+import WebSocket from 'ws';
 
 class AppServerRejection extends Error {
   constructor(code) {
@@ -15,7 +16,17 @@ export function openAppServer(onEvent, onDisconnect) {
     stdio: ['pipe', 'pipe', 'ignore'],
     windowsHide: true,
   });
-  const lines = createInterface({ input: proxy.stdout });
+  // The proxy carries raw bytes to the local control socket, including WebSocket framing.
+  const transport = new Duplex({
+    read() { proxy.stdout.resume(); },
+    write(chunk, encoding, callback) { proxy.stdin.write(chunk, encoding, callback); },
+  });
+  const socket = new WebSocket('ws://localhost', {
+    createConnection: () => transport,
+    perMessageDeflate: false,
+  });
+  const handshakeTimer = setTimeout(close, 10_000);
+  const { promise: ready, resolve: markReady } = Promise.withResolvers();
   let nextId = 0;
   let closed = false;
   const pending = new Map();
@@ -25,9 +36,12 @@ export function openAppServer(onEvent, onDisconnect) {
   function close() {
     if (closed) return;
     closed = true;
+    clearTimeout(handshakeTimer);
     for (const request of pending.values()) request.reject(disconnected);
     pending.clear();
-    lines.close();
+    markReady(false);
+    socket.terminate();
+    transport.destroy();
     proxy.kill();
     onDisconnect();
   }
@@ -36,11 +50,24 @@ export function openAppServer(onEvent, onDisconnect) {
   proxy.on('exit', close);
   proxy.stdin.on('error', close);
   proxy.stdout.on('error', close);
-  lines.on('close', close);
-  lines.on('line', (line) => {
+  proxy.stdout.on('end', close);
+  proxy.stdout.on('data', (chunk) => {
+    if (!transport.push(chunk)) proxy.stdout.pause();
+  });
+  socket.on('open', () => {
+    clearTimeout(handshakeTimer);
+    markReady(true);
+  });
+  socket.on('error', close);
+  socket.on('close', close);
+  socket.on('message', (data, binary) => {
+    if (binary) {
+      close();
+      return;
+    }
     let message;
     try {
-      message = JSON.parse(line);
+      message = JSON.parse(data.toString());
     } catch {
       close();
       return;
@@ -68,7 +95,7 @@ export function openAppServer(onEvent, onDisconnect) {
 
   function write(packet) {
     if (closed) throw disconnected;
-    proxy.stdin.write(JSON.stringify(packet) + '\n');
+    socket.send(JSON.stringify(packet), (error) => { if (error) close(); });
   }
 
   async function call(method, params) {
@@ -123,7 +150,7 @@ export function openAppServer(onEvent, onDisconnect) {
   function respond(id, result) {
     return new Promise((resolve, reject) => {
       if (closed) throw disconnected;
-      proxy.stdin.write(JSON.stringify({ id, result }) + '\n', (error) => {
+      socket.send(JSON.stringify({ id, result }), (error) => {
         if (error) reject(disconnected);
         else resolve(undefined);
       });
@@ -132,6 +159,7 @@ export function openAppServer(onEvent, onDisconnect) {
 
   return {
     async initialize() {
+      if (!await ready || closed) throw disconnected;
       await call('initialize', {
         clientInfo: { name: 'telegram-agent', version: '0.1.0' },
         capabilities: { experimentalApi: true },

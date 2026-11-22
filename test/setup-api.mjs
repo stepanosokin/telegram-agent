@@ -2,7 +2,9 @@
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 import { createRequire, syncBuiltinESMExports } from 'node:module';
-import { PassThrough } from 'node:stream';
+import { connect } from 'node:net';
+import { PassThrough, Transform } from 'node:stream';
+import { WebSocketServer } from 'ws';
 
 const childProcess = createRequire(import.meta.url)('node:child_process');
 const spawn = childProcess.spawn;
@@ -30,9 +32,10 @@ const { promise: openCodeViewRead, resolve: recordOpenCodeViewRead } = Promise.w
 let openCodePosts = 0;
 let openCodeStream;
 let openCodeProbes = 0;
-let openCodeResumePublished;
+let openCodeSecondPublished;
 let openCodeFormState = { status: 'pending' };
 let openCodeChoiceEdits = 0;
+let openCodePermission;
 let emitCodexPacket;
 const openCodeEncoder = new TextEncoder();
 
@@ -124,12 +127,13 @@ globalThis.fetch = async (url, options) => {
       return new Response(null, { status: 204 });
     }
     const permissionPath = `/api/session/${sessionID}/permission`;
+    const pendingPermission = openCodePermission ?? permission;
     if (target.pathname === permissionPath) {
-      return Response.json({ data: permission ? [permission] : [] });
+      return Response.json({ data: pendingPermission ? [pendingPermission] : [] });
     }
     if (permission && method === 'GET' && target.pathname === `${permissionPath}/${permission.id}`) {
       const changed = scenario.openCode.changePermission;
-      return Response.json({ data: changed ? { ...permission, resources: ['/fixture/different.txt'] } : permission });
+      return Response.json({ data: changed ? { ...permission, resources: ['/fixture/different.txt'] } : pendingPermission });
     }
     return new Response(null, { status: 404 });
   }
@@ -158,7 +162,7 @@ globalThis.fetch = async (url, options) => {
       if (params.text.startsWith('OpenCode ·')) {
         openCodePosts++;
         recordOpenCodePublish();
-        if (openCodePosts > 1) openCodeResumePublished?.();
+        if (openCodePosts > 1) openCodeSecondPublished?.();
       }
       if (params.reply_markup?.inline_keyboard.length) {
         const original = scenario.updates?.find(({ message }) => message?.message_id === params.reply_parameters?.message_id);
@@ -205,9 +209,23 @@ globalThis.fetch = async (url, options) => {
         }
         if (scenario.openCode?.viewedOnStartup) await openCodeViewRead;
         result = scenario.updates || [];
+      } else if (polls === 2 && scenario.openCode?.replacePermission) {
+        const { sessionID, permission, replacePermission } = scenario.openCode;
+        const { promise, resolve } = Promise.withResolvers();
+        openCodeSecondPublished = resolve;
+        sendOpenCodeEvent({
+          type: 'permission.replied', id: 'permission-replied', created: 2,
+          data: { sessionID, requestID: permission.id, reply: 'reject' },
+        });
+        openCodePermission = replacePermission;
+        sendOpenCodeEvent({
+          type: 'permission.asked', id: 'permission-replacement', created: 3, data: replacePermission,
+        });
+        await promise;
+        result = [];
       } else if (polls === 2 && scenario.openCode?.resumedReply) {
         const { promise, resolve } = Promise.withResolvers();
-        openCodeResumePublished = resolve;
+        openCodeSecondPublished = resolve;
         sendOpenCodeText(scenario.openCode.sessionID, 'Новый ответ после возобновления');
         await promise;
         result = [scenario.openCode.resumedReply];
@@ -231,14 +249,16 @@ globalThis.fetch = async (url, options) => {
   return Response.json({ ok: true, result });
 };
 
-function makeCallback({ prompt, choice, tokenFrom = prompt, messageOverrides, ...overrides }, index) {
+function makeCallback({ prompt, choice, choiceLabel, tokenFrom = prompt, messageOverrides, ...overrides }, index) {
+  const buttons = prompts[tokenFrom]?.choices;
+  const button = choiceLabel ? buttons?.find(({ text }) => text.startsWith(choiceLabel)) : buttons?.[choice];
   return {
     update_id: 100 + index,
     callback_query: {
       id: `callback-${index}`,
       from: { id: 300, is_bot: false },
       message: { ...prompts[prompt]?.message, ...messageOverrides },
-      data: prompts[tokenFrom]?.choices[choice]?.callback_data,
+      data: button?.callback_data,
       ...overrides,
     },
   };
@@ -247,28 +267,42 @@ function makeCallback({ prompt, choice, tokenFrom = prompt, messageOverrides, ..
 childProcess.spawn = (command, args, options) => {
   if (command !== 'codex') return spawn(command, args, options);
   assert.deepEqual(args, ['app-server', 'proxy']);
+  const server = new WebSocketServer({ host: '127.0.0.1', port: 0 });
+  let transport;
+  let socket;
+  let failNextWrite = false;
   const proxy = Object.assign(new EventEmitter(), {
-    stdin: new PassThrough(),
+    stdin: new Transform({
+      transform(chunk, encoding, callback) {
+        if (!failNextWrite) {
+          callback(null, chunk);
+          return;
+        }
+        emit({ method: 'serverRequest/resolved', params: {
+          threadId: scenario.codexChoice.params.threadId, requestId: scenario.codexChoice.id,
+        } });
+        callback(new Error('fixture write failure'));
+      },
+    }),
     stdout: new PassThrough(),
     kill() {
+      socket?.terminate();
+      transport?.destroy();
+      server.close();
       this.stdout.end();
     },
   });
-  const emit = (packet) => proxy.stdout.write(JSON.stringify(packet) + '\n');
+  server.on('listening', () => {
+    if (scenario.codexHandshakeStalls) return;
+    transport = connect({ host: '127.0.0.1', port: server.address().port });
+    transport.on('error', (error) => proxy.emit('error', error));
+    proxy.stdin.pipe(transport).pipe(proxy.stdout);
+  });
+  server.on('error', (error) => proxy.emit('error', error));
+  const emit = (packet) => socket.send(JSON.stringify(packet));
   emitCodexPacket = emit;
-  if (scenario.failChoiceWrite) {
-    const originalWrite = proxy.stdin._write.bind(proxy.stdin);
-    proxy.stdin._write = (chunk, encoding, callback) => {
-      const packet = JSON.parse(chunk);
-      if (!packet.method && packet.result) {
-        emit({ method: 'serverRequest/resolved', params: { threadId: scenario.codexChoice.params.threadId, requestId: packet.id } });
-        queueMicrotask(() => callback(new Error('fixture write failure')));
-        return;
-      }
-      originalWrite(chunk, encoding, callback);
-    };
-  }
-  proxy.stdin.on('data', (line) => {
+
+  function onMessage(line) {
     const { method, id, params, result: clientResult } = JSON.parse(line);
     if (!method && clientResult && scenario.codexChoice) {
       record('codex', 'serverResponse', { id, result: clientResult });
@@ -302,6 +336,7 @@ childProcess.spawn = (command, args, options) => {
           return;
         }
         if (scenario.closeWhileChecking && polls >= 2) emit(scenario.closeWhileChecking);
+        if (scenario.failChoiceWrite && polls >= 2) failNextWrite = true;
         result = { data: session?.turns || [] };
         break;
       case 'thread/resume':
@@ -362,6 +397,11 @@ childProcess.spawn = (command, args, options) => {
         },
       });
     }
+  }
+  server.on('connection', (connection) => {
+    socket = connection;
+    socket.on('error', (error) => proxy.emit('error', error));
+    socket.on('message', onMessage);
   });
   return proxy;
 };

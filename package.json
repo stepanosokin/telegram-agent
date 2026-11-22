@@ -8,6 +8,7 @@
     "test": "node --test \"test/*.test.mjs\""
   },
   "dependencies": {
-    "@opencode/client": "2.3.2"
+    "@opencode/client": "2.3.2",
+    "ws": "8.23.0"
   }
 }
