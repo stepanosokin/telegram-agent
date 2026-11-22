@@ -1,7 +1,9 @@
 import { randomUUID } from 'node:crypto';
+import { isDeepStrictEqual } from 'node:util';
 import { openAppServer } from './codex.mjs';
 import { codexChoices } from './codex-choices.mjs';
 import { openCodeForms } from './opencode-forms.mjs';
+import { codexPermission, openCodePermissionDescription, permissions } from './permissions.mjs';
 import { readProfile } from './profile.mjs';
 import { isOwnerCallback, isOwnerMessage, telegramClient, TelegramError } from './telegram.mjs';
 
@@ -46,34 +48,60 @@ async function runReceiver(telegram, profile, threadIds, openCodeIds, stopSignal
   let outgoing = Promise.resolve();
   const choices = codexChoices(telegram, (session) => sessionLabel(session, 160));
   const forms = openCodeForms(telegram, (session) => sessionLabel(session, 160));
+  const approvals = permissions(telegram, (session) => sessionLabel(session, 160), bindMessage);
+
+  function bindMessage(session, published) {
+    if (sessions.get(session.key) === session && Number.isSafeInteger(published?.message_id) && published.message_id > 0) {
+      session.confirmed = true;
+      messageBindings.set(published.message_id, session);
+    }
+  }
 
   async function publish(session, body) {
     if (!body.trim()) return;
     const header = `${sessionLabel(session, 160)}\n\n`;
     for (const text of withHeader(header, body)) {
-      const published = await telegram.send(text);
-      if (Number.isSafeInteger(published?.message_id) && published.message_id > 0) {
-        messageBindings.set(published.message_id, session);
-      }
+      bindMessage(session, await telegram.send(text));
     }
   }
 
   const codex = threadIds.size ? openAppServer((method, event, requestId) => {
-    if (method === 'serverRequest/resolved') void choices.resolve(event?.threadId, event?.requestId);
     const key = `Codex:${event?.threadId}`;
+    if (method === 'serverRequest/resolved') {
+      void choices.resolve(event?.threadId, event?.requestId);
+      approvals.resolve(key, event?.requestId);
+    }
     const session = sessions.get(key);
     if (!session) return;
     if (method === 'thread/closed' || method === 'thread/archived' || method === 'thread/deleted'
       || (method === 'thread/status/changed' && event.status?.type === 'notLoaded')) {
       sessions.delete(key);
       choices.clearThread(session.id);
+      approvals.clear('Codex', session.id);
       return;
     }
-    if (method === 'turn/completed') choices.finishTurn(session.id, event.turn?.id);
-    if (method === 'turn/started') choices.startTurn(session.id, event.turn?.id);
+    if (method === 'turn/completed') {
+      choices.finishTurn(session.id, event.turn?.id);
+      approvals.clear('Codex', session.id, { matches: (id) => id === event.turn?.id });
+    }
+    if (method === 'turn/started') {
+      choices.startTurn(session.id, event.turn?.id);
+      approvals.clear('Codex', session.id, { matches: (id) => id !== event.turn?.id });
+    }
     if (requestId !== undefined) {
-      void choices.publish(session, requestId, event, confirmCodexTurn)
-        .catch(() => console.error('Не удалось опубликовать запрос выбора Codex в Telegram.'));
+      if (method === 'item/tool/requestUserInput') {
+        void choices.publish(session, requestId, event, confirmCodexTurn)
+          .catch(() => console.error('Не удалось опубликовать запрос выбора Codex в Telegram.'));
+      } else if (typeof event.turnId === 'string' && event.turnId) {
+        const publication = approvals.publish({
+          session, id: requestId, turnId: event.turnId,
+          details: codexPermission(method, event),
+          confirm: () => confirmCodexTurn(session, event.turnId),
+          respond: (decision, resolved) => codex.respondPermission(requestId, decision, resolved),
+        })
+          .catch(() => console.error('Не удалось опубликовать запрос разрешения Codex в Telegram.'));
+        outgoing = Promise.all([outgoing, publication]).then(() => {});
+      }
       return;
     }
     if (method === 'thread/name/updated' && typeof event.threadName === 'string') {
@@ -87,7 +115,10 @@ async function runReceiver(telegram, profile, threadIds, openCodeIds, stopSignal
       session.confirmed = true;
       await publish(session, event.item.text);
     }).catch(() => console.error('Не удалось опубликовать сообщение Codex в Telegram.'));
-  }, () => choices.clearThread(undefined)) : undefined;
+  }, () => {
+    choices.clearThread(undefined);
+    approvals.clear('Codex', undefined, { disconnected: true });
+  }) : undefined;
 
   async function confirmCodexTurn(session, turnId) {
     try {
@@ -108,6 +139,7 @@ async function runReceiver(telegram, profile, threadIds, openCodeIds, stopSignal
   function clearOpenCodeSessions() {
     openCodeConnected = false;
     forms.close();
+    approvals.clear('OpenCode', undefined, { disconnected: true });
     for (const [key, session] of sessions) {
       if (session.agent === 'OpenCode') sessions.delete(key);
     }
@@ -117,6 +149,10 @@ async function runReceiver(telegram, profile, threadIds, openCodeIds, stopSignal
     const id = event.type === 'form.created' ? event.data?.form?.sessionID : event.data?.sessionID;
     if (!openCodeIds.has(id)) return;
     const key = `OpenCode:${id}`;
+    if (event.type === 'permission.replied') {
+      approvals.resolve(key, event.data.requestID);
+      return;
+    }
     if (event.type === 'form.replied' || event.type === 'form.cancelled') {
       forms.close(id, event.data.id);
       return;
@@ -125,6 +161,7 @@ async function runReceiver(telegram, profile, threadIds, openCodeIds, stopSignal
       openCodeRevisions.set(key, Symbol());
       sessions.delete(key);
       forms.close(id);
+      approvals.clear('OpenCode', id);
       return;
     }
     if (event.type === 'session.renamed') {
@@ -132,7 +169,8 @@ async function runReceiver(telegram, profile, threadIds, openCodeIds, stopSignal
       if (session && typeof event.data.title === 'string') session.name = event.data.title;
       return;
     }
-    if (!['session.text.ended', 'session.viewed', 'session.execution.started', 'form.created'].includes(event.type)) return;
+    if (!['session.text.ended', 'session.viewed', 'session.execution.started', 'form.created', 'permission.asked']
+      .includes(event.type)) return;
     const revision = openCodeRevisions.get(key);
     outgoing = outgoing.then(async () => {
       const connection = await openCodeReady;
@@ -146,10 +184,28 @@ async function runReceiver(telegram, profile, threadIds, openCodeIds, stopSignal
         await forms.publish(session, event.data.form.id, connection, () =>
           openCodeConnected && !stopSignal.aborted && sessions.get(key) === session);
       }
+      if (session && event.type === 'permission.asked') {
+        await publishOpenCodePermission(connection, session, event.data);
+      }
       if (session && event.type === 'session.text.ended' && typeof event.data.text === 'string') {
         await publish(session, event.data.text);
       }
     }).catch(() => console.error('Не удалось опубликовать сообщение OpenCode в Telegram.'));
+  }
+
+  async function publishOpenCodePermission(connection, session, request) {
+    const requestId = request.id;
+    if (typeof requestId !== 'string' || !requestId.startsWith('per')) return;
+    const { id, key } = session;
+    const connected = () => openCodeConnected && !stopSignal.aborted && sessions.get(key) === session;
+    // OpenCode 2.3.2 accepts a reused request ID and reply lacks an atomic comparison of the request.
+    await approvals.publish({
+      session, id: requestId, details: { description: openCodePermissionDescription(request) },
+      confirm: async (isOpen) => {
+        const current = await connection.readPermission(id, requestId).catch(() => undefined);
+        return connected() && isOpen() && isDeepStrictEqual(current, request);
+      },
+    });
   }
 
   async function confirmOpenCodeSession(connection, id, revision) {
@@ -284,14 +340,20 @@ async function runReceiver(telegram, profile, threadIds, openCodeIds, stopSignal
       const key = `OpenCode:${id}`;
       const revision = openCodeRevisions.get(key);
       const pending = await openCode?.pendingForms(id).catch(() => undefined);
-      if (!pending?.length) continue;
+      const pendingApprovals = await openCode?.pendingPermissions(id).catch(() => undefined);
+      if (!pending?.length && !pendingApprovals?.length) continue;
       const session = await confirmOpenCodeSession(openCode, id, revision);
       if (session) {
-        for (const form of pending) {
+        for (const form of pending ?? []) {
           if (form.sessionID !== id) continue;
           await forms.publish(session, form.id, openCode, () =>
             openCodeConnected && !stopSignal.aborted && sessions.get(key) === session)
             .catch(() => console.error('Не удалось опубликовать форму OpenCode в Telegram.'));
+        }
+        for (const request of pendingApprovals ?? []) {
+          if (request.sessionID !== id) continue;
+          await publishOpenCodePermission(openCode, session, request)
+            .catch(() => console.error('Не удалось опубликовать запрос разрешения OpenCode в Telegram.'));
         }
       }
     }
@@ -314,6 +376,7 @@ async function runReceiver(telegram, profile, threadIds, openCodeIds, stopSignal
         offset = update.update_id + 1;
         if (update.callback_query) {
           if (!isOwnerCallback(update.callback_query, profile)) continue;
+          if (await approvals.handle(update.callback_query)) continue;
           if (await choices.handle(update.callback_query, confirmCodexTurn, (id, result) => codex.respond(id, result))) continue;
           if (await forms.handle(update.callback_query)) continue;
           await chooseSession(update.callback_query);

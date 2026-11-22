@@ -54,7 +54,8 @@ export function openAppServer(onEvent, onDisconnect) {
       onEvent(message.method, message.params);
       return;
     }
-    if (message?.method === 'item/tool/requestUserInput'
+    if (['item/tool/requestUserInput', 'item/commandExecution/requestApproval',
+      'item/fileChange/requestApproval', 'item/permissions/requestApproval'].includes(message?.method)
       && (typeof message.id === 'string' || Number.isSafeInteger(message.id))) {
       onEvent(message.method, message.params, message.id);
       return;
@@ -119,6 +120,16 @@ export function openAppServer(onEvent, onDisconnect) {
     if (activeTurn?.status === 'inProgress' && typeof activeTurn.id === 'string' && activeTurn.id) return activeTurn.id;
   }
 
+  function respond(id, result) {
+    return new Promise((resolve, reject) => {
+      if (closed) throw disconnected;
+      proxy.stdin.write(JSON.stringify({ id, result }) + '\n', (error) => {
+        if (error) reject(disconnected);
+        else resolve(undefined);
+      });
+    });
+  }
+
   return {
     async initialize() {
       await call('initialize', {
@@ -149,14 +160,17 @@ export function openAppServer(onEvent, onDisconnect) {
       return response?.thread;
     },
     activeTurnId,
-    respond(id, result) {
-      return new Promise((resolve, reject) => {
-        if (closed) throw disconnected;
-        proxy.stdin.write(JSON.stringify({ id, result }) + '\n', (error) => {
-          if (error) reject(disconnected);
-          else resolve(undefined);
-        });
-      });
+    respond,
+    async respondPermission(id, decision, resolved) {
+      // Closure alone does not identify which client answered the request.
+      const deadline = new AbortController();
+      try {
+        const written = respond(id, { decision }).then(() => resolved);
+        return await Promise.race([written, delay(1500, false, { signal: deadline.signal })])
+          ? 'sent' : 'unknown';
+      } finally {
+        deadline.abort();
+      }
     },
     async deliver(thread, text) {
       const threadId = thread.id;

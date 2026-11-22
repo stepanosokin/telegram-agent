@@ -87,6 +87,12 @@ export async function openOpenCode(onEvent, onDisconnect, stopSignal) {
         return 'unknown';
       }
     },
+    async pendingPermissions(sessionID) {
+      if (await currentServer()) return client.permission.list({ sessionID }, request());
+    },
+    async readPermission(sessionID, requestID) {
+      if (await currentServer()) return client.permission.get({ sessionID, requestID }, request());
+    },
     async deliver(sessionID, text) {
       try {
         if (!await currentServer()) return 'unconfirmed';

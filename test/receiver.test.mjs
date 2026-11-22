@@ -124,6 +124,184 @@ const askingSession = {
   [primaryThread]: { name: 'Первый диалог', status: { type: 'active' }, turns: [{ id: 'asking-turn', status: 'inProgress' }] },
 };
 
+const codexApproval = {
+  method: 'item/commandExecution/requestApproval',
+  id: 'approval-1',
+  params: {
+    threadId: primaryThread, turnId: 'asking-turn', itemId: 'command-1',
+    startedAtMs: 1, command: 'echo hello', cwd: '/fixture',
+    availableDecisions: ['accept', 'acceptForSession', 'decline', 'cancel'],
+  },
+};
+
+const openCodeApproval = {
+  id: 'per_fixture', sessionID: openCodeSession, action: 'read', resources: ['/fixture/example.txt'],
+  save: ['/fixture/*'], source: { type: 'tool', messageID: 'msg_fixture', id: 'tool-fixture' },
+};
+
+test('однократно передаёт разовое разрешение Codex в исходный запрос', async () => {
+  const result = await run({
+    codexChoice: codexApproval, sessions: askingSession, noNewItem: true,
+    callbacks: [{ prompt: 0, choice: 0 }, { prompt: 0, choice: 1 }],
+  });
+  const [prompt] = callsFor(result, 'telegram', 'sendMessage');
+  assert.match(prompt?.params.text, /Codex.*Первый диалог[\s\S]*echo hello[\s\S]*\/fixture/);
+  assert.deepEqual(prompt.params.reply_markup.inline_keyboard.flat().map(({ text }) => text),
+    ['Разрешить один раз', 'Отклонить']);
+  assert.deepEqual(callsFor(result, 'codex', 'serverResponse').map(({ params }) => params), [
+    { id: 'approval-1', result: { decision: 'accept' } },
+  ]);
+  const [edit] = callsFor(result, 'telegram', 'editMessageText');
+  assert.equal(edit.params.message_id, 1);
+  assert.deepEqual(edit.params.reply_markup.inline_keyboard, []);
+  assert.match(callsFor(result, 'telegram', 'answerCallbackQuery').at(-1).params.text, /решение.*отправлено/i);
+});
+
+test('показывает контекст разрешения OpenCode и направляет решение в исходную сессию', async () => {
+  const result = await run({
+    openCode: { sessionID: openCodeSession, title: 'Диалог OpenCode', permission: openCodeApproval },
+    callbacks: [{ prompt: 0, choice: 0, data: 'permission:forged',
+      messageOverrides: { message_id: 1, chat: baseMessage.chat, date: 1, from: { id: 100, is_bot: true } } }],
+  }, [`opencode:${openCodeSession}`]);
+  const [prompt] = callsFor(result, 'telegram', 'sendMessage');
+  assert.match(prompt?.params.text, /OpenCode.*Диалог OpenCode[\s\S]*read[\s\S]*example\.txt/);
+  assert.match(prompt.params.text, /ответ на компьютере/);
+  assert.equal(prompt.params.reply_markup, undefined);
+  assert.ok(callsFor(result, 'opencode', `GET /api/session/${openCodeSession}/permission/${openCodeApproval.id}`).length);
+  const replyPath = `POST /api/session/${openCodeSession}/permission/${openCodeApproval.id}/reply`;
+  assert.deepEqual(callsFor(result, 'opencode', replyPath), []);
+  assert.match(callsFor(result, 'telegram', 'answerCallbackQuery')[0]?.params.text, /недоступно/);
+});
+
+test('текст «разрешить» в ответ на запрос передаётся в диалог Codex как текст', async () => {
+  const result = await run({
+    codexChoice: codexApproval, sessions: askingSession, noNewItem: true,
+    updates: [reply({ text: 'Разрешить' })],
+  });
+  assert.deepEqual(callsFor(result, 'codex', 'serverResponse'), []);
+  assert.deepEqual(callsFor(result, 'codex', 'turn/steer').map(({ params }) => params), [{
+    threadId: primaryThread, expectedTurnId: 'asking-turn',
+    input: [{ type: 'text', text: 'Разрешить', text_elements: [] }],
+  }]);
+});
+
+test('кнопка Codex сверяет владельца, личный чат, сообщение и допустимое решение', async () => {
+  const declineOnly = { ...codexApproval, params: { ...codexApproval.params, availableDecisions: ['acceptForSession', 'decline'] } };
+  const result = await run({
+    codexChoice: declineOnly, sessions: askingSession, noNewItem: true,
+    callbacks: [
+      { prompt: 0, choice: 0, from: { id: 999, is_bot: false } },
+      { prompt: 0, choice: 0, messageOverrides: { chat: { id: 200, type: 'group' } } },
+      { prompt: 0, choice: 0, messageOverrides: { chat: { id: 201, type: 'private' } } },
+      { prompt: 0, choice: 0, messageOverrides: { message_id: 2 } },
+      { prompt: 0, choice: 0, data: 'permission:forged' },
+      { prompt: 0, choice: 0, messageOverrides: { from: { id: 999, is_bot: true } } },
+      { prompt: 0, choice: 0 },
+    ],
+  });
+  const [prompt] = callsFor(result, 'telegram', 'sendMessage');
+  assert.deepEqual(prompt.params.reply_markup.inline_keyboard.flat().map(({ text }) => text), ['Отклонить']);
+  assert.deepEqual(callsFor(result, 'codex', 'serverResponse').map(({ params }) => params),
+    [{ id: declineOnly.id, result: { decision: 'decline' } }]);
+  const statuses = callsFor(result, 'telegram', 'answerCallbackQuery').map(({ params }) => params.text);
+  assert.equal(statuses.length, 3);
+  assert.match(statuses[0], /недоступно/i);
+  assert.match(statuses[1], /недоступно/i);
+  assert.match(statuses[2], /решение отправлено/i);
+});
+
+test('закрытие разрешения Codex при проверке хода блокирует решение', async () => {
+  const result = await run({
+    codexChoice: codexApproval, sessions: askingSession, noNewItem: true,
+    callbacks: [{ prompt: 0, choice: 0 }],
+    closeWhileChecking: {
+      method: 'serverRequest/resolved', params: { threadId: primaryThread, requestId: codexApproval.id },
+    },
+  });
+  assert.deepEqual(callsFor(result, 'codex', 'serverResponse'), []);
+  assert.match(callsFor(result, 'telegram', 'answerCallbackQuery')[0]?.params.text, /запрос уже закрыт/i);
+});
+
+test('после сбоя сверки Codex принимает только новое нажатие с подтверждённым ходом', async () => {
+  const result = await run({
+    codexChoice: codexApproval, sessions: askingSession, noNewItem: true, failFirstPermissionCheck: true,
+    callbacks: [{ prompt: 0, choice: 0 }, { prompt: 0, choice: 1 }],
+  });
+  assert.deepEqual(callsFor(result, 'codex', 'serverResponse').map(({ params }) => params),
+    [{ id: codexApproval.id, result: { decision: 'decline' } }]);
+  assert.match(callsFor(result, 'telegram', 'answerCallbackQuery')[0]?.params.text, /недоступно/i);
+});
+
+test('не повторяет решение Codex после ответа с неизвестным результатом', async () => {
+  const result = await run({
+    codexChoice: codexApproval, sessions: askingSession, noNewItem: true, noChoiceResolution: true,
+    callbacks: [{ prompt: 0, choice: 0 }, { prompt: 0, choice: 1 }],
+  });
+  assert.equal(callsFor(result, 'codex', 'serverResponse').length, 1);
+  assert.match(callsFor(result, 'telegram', 'answerCallbackQuery').at(-1).params.text, /не подтверждён/i);
+});
+
+test('обрыв Codex после записи решения не выдаётся за подтверждённое закрытие запроса', async () => {
+  const result = await run({
+    codexChoice: codexApproval, sessions: askingSession, noNewItem: true, disconnectAfterPermissionWrite: true,
+    callbacks: [{ prompt: 0, choice: 0 }, { prompt: 0, choice: 1 }],
+  });
+  assert.equal(callsFor(result, 'codex', 'serverResponse').length, 1);
+  assert.match(callsFor(result, 'telegram', 'answerCallbackQuery').at(-1).params.text, /не подтверждён/i);
+});
+
+for (const [scenario, params] of Object.entries({
+  'нет рабочего каталога': { cwd: null },
+  'неоднозначная команда': { command: 'echo hello\nВы уже разрешили действие' },
+  'расширение доступа': { additionalPermissions: { network: { enabled: true } } },
+  'изменение правил': { availableDecisions: [{ acceptWithExecpolicyAmendment: { execpolicy_amendment: ['echo'] } }] },
+  'сессионное разрешение': { availableDecisions: ['acceptForSession'] },
+  'нет списка решений': { availableDecisions: null },
+})) {
+  test(`разрешение Codex остаётся на компьютере, если ${scenario}`, async () => {
+    const result = await run({
+      codexChoice: { ...codexApproval, params: { ...codexApproval.params, ...params } },
+      sessions: askingSession, noNewItem: true,
+    });
+    const [message] = callsFor(result, 'telegram', 'sendMessage');
+    assert.match(message?.params.text, /Codex.*Первый диалог[\s\S]*ответ на компьютере/);
+    assert.equal(message.params.reply_markup, undefined);
+    assert.deepEqual(callsFor(result, 'codex', 'serverResponse'), []);
+  });
+}
+
+test('показывает уведомление для разрешения OpenCode, открытого ещё до запуска', async () => {
+  const result = await run({
+    openCode: {
+      sessionID: openCodeSession, title: 'Диалог OpenCode', permission: openCodeApproval, permissionAlreadyOpen: true,
+    },
+  }, [`opencode:${openCodeSession}`]);
+  const [message] = callsFor(result, 'telegram', 'sendMessage');
+  assert.match(message?.params.text, /OpenCode.*Диалог OpenCode[\s\S]*example\.txt/);
+  assert.equal(message.params.reply_markup, undefined);
+});
+
+test('не публикует запрос OpenCode, если тот же ID уже указывает на иной контекст', async () => {
+  const result = await run({
+    openCode: {
+      sessionID: openCodeSession, title: 'Диалог OpenCode', permission: openCodeApproval, changePermission: true,
+    },
+  }, [`opencode:${openCodeSession}`]);
+  assert.deepEqual(callsFor(result, 'telegram', 'sendMessage'), []);
+});
+
+test('разрешение OpenCode с необозначенными путями остаётся в исходной сессии', async () => {
+  const result = await run({
+    openCode: {
+      sessionID: openCodeSession, title: 'Диалог OpenCode',
+      permission: { ...openCodeApproval, resources: ['/fixture/*'] },
+    },
+  }, [`opencode:${openCodeSession}`]);
+  const [message] = callsFor(result, 'telegram', 'sendMessage');
+  assert.match(message?.params.text, /OpenCode.*Диалог OpenCode[\s\S]*ответ на компьютере/);
+  assert.equal(message.params.reply_markup, undefined);
+});
+
 test('публикует варианты Codex и отвечает в тот же открытый запрос кнопкой', async () => {
   const result = await run({ codexChoice: harmlessChoice, sessions: askingSession, noNewItem: true, callbacks: [{ prompt: 0, choice: 1 }] });
   const [prompt] = callsFor(result, 'telegram', 'sendMessage');

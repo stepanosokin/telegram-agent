@@ -20,6 +20,7 @@ const sessions = scenario.sessions || {
   [threadIds[0]]: { name: 'Первый диалог', status: { type: 'idle' }, turns: [] },
 };
 let rpcCount = 0;
+let callbackTurnChecks = 0;
 let polls = 0;
 let sentCount = 0;
 const prompts = [];
@@ -63,7 +64,7 @@ globalThis.fetch = async (url, options) => {
     const method = options?.method ?? (url instanceof Request ? url.method : 'GET');
     const body = options?.body ? JSON.parse(options.body) : method === 'POST' && url instanceof Request ? await url.json() : undefined;
     record('opencode', `${method} ${target.pathname}`, body);
-    const { sessionID, title, text, isolated, form } = scenario.openCode;
+    const { sessionID, title, text, isolated, form, permission } = scenario.openCode;
     if (target.pathname === '/api/info') {
       const pid = ++openCodeProbes >= 3 && scenario.openCode.replaceProcess ? 5678 : 1234;
       return Response.json({ pid, version: '2.3.2' });
@@ -77,6 +78,9 @@ globalThis.fetch = async (url, options) => {
           if (text) sendOpenCodeText(sessionID, text);
           if (form && !scenario.openCode.formAlreadyOpen) sendOpenCodeEvent({
             type: 'form.created', id: 'form-created', created: 1, data: { form },
+          });
+          if (permission && !scenario.openCode.permissionAlreadyOpen) sendOpenCodeEvent({
+            type: 'permission.asked', id: 'permission-asked', created: 1, data: permission,
           });
           signal?.addEventListener('abort', () => controller.error(signal.reason), { once: true });
         },
@@ -111,6 +115,14 @@ globalThis.fetch = async (url, options) => {
         data: { id: form.id, sessionID, answer: body.answer },
       });
       return new Response(null, { status: 204 });
+    }
+    const permissionPath = `/api/session/${sessionID}/permission`;
+    if (target.pathname === permissionPath) {
+      return Response.json({ data: permission ? [permission] : [] });
+    }
+    if (permission && method === 'GET' && target.pathname === `${permissionPath}/${permission.id}`) {
+      const changed = scenario.openCode.changePermission;
+      return Response.json({ data: changed ? { ...permission, resources: ['/fixture/different.txt'] } : permission });
     }
     return new Response(null, { status: 404 });
   }
@@ -179,7 +191,11 @@ globalThis.fetch = async (url, options) => {
           await Promise.race([codexChoicePublished, new Promise((resolve) => { deadline = setTimeout(resolve, 1000); })]);
           clearTimeout(deadline);
         }
-        if (scenario.openCode?.text || scenario.openCode?.form) await openCodePublished;
+        if (scenario.openCode?.text || scenario.openCode?.form || scenario.openCode?.permission) {
+          let deadline;
+          await Promise.race([openCodePublished, new Promise((resolve) => { deadline = setTimeout(resolve, 1500); })]);
+          clearTimeout(deadline);
+        }
         result = scenario.updates || [];
       } else if (polls === 2 && scenario.openCode?.resumedReply) {
         const { promise, resolve } = Promise.withResolvers();
@@ -248,7 +264,9 @@ childProcess.spawn = (command, args, options) => {
     const { method, id, params, result: clientResult } = JSON.parse(line);
     if (!method && clientResult && scenario.codexChoice) {
       record('codex', 'serverResponse', { id, result: clientResult });
-      if (!scenario.noChoiceResolution) {
+      if (scenario.disconnectAfterPermissionWrite) {
+        queueMicrotask(() => proxy.stdout.end());
+      } else if (!scenario.noChoiceResolution) {
         emit({ method: 'serverRequest/resolved', params: { threadId: scenario.codexChoice.params.threadId, requestId: id } });
       }
       return;
@@ -271,6 +289,10 @@ childProcess.spawn = (command, args, options) => {
         result = { thread: { id: threadId, ...session } };
         break;
       case 'thread/turns/list':
+        if (scenario.failFirstPermissionCheck && polls >= 2 && ++callbackTurnChecks === 1) {
+          emit({ id, error: { code: -32603, message: 'Temporary fixture error' } });
+          return;
+        }
         if (scenario.closeWhileChecking && polls >= 2) emit(scenario.closeWhileChecking);
         result = { data: session?.turns || [] };
         break;
