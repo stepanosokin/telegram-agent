@@ -1,7 +1,7 @@
 // Preloaded into the receiver process to substitute only its external APIs.
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
-import { writeFile } from 'node:fs/promises';
+import { readFile, writeFile } from 'node:fs/promises';
 import { createRequire, syncBuiltinESMExports } from 'node:module';
 import { connect } from 'node:net';
 import { join } from 'node:path';
@@ -16,6 +16,20 @@ const scenario = JSON.parse(process.env.TELEGRAM_AGENT_SCENARIO);
 const inspectProcess = (...args) => execFile(...args);
 inspectProcess[promisify.custom] = (...args) => {
   const evidence = args[2]?.env;
+  if (scenario.scheduler) {
+    if (evidence?.TELEGRAM_AGENT_TASK_NAME || args[0] === 'systemctl') {
+      record('scheduler', args[0] === 'systemctl' ? args[1][1] : evidence.TELEGRAM_AGENT_TASK_MODE);
+      return Promise.resolve({ stdout: '' });
+    }
+    if (args[0] === 'loginctl') {
+      record('login', args[1][0]);
+      if (args[1][0] === 'show-user') {
+        return readFile(join(process.env.HOME, 'login-state'), 'utf8')
+          .then((stdout) => ({ stdout }), () => ({ stdout: '' }));
+      }
+      return Promise.resolve({ stdout: `User=${process.getuid()}\nClass=user\nState=active\n` });
+    }
+  }
   if (scenario.codexIdentity && evidence?.TELEGRAM_AGENT_CODEX_PID && evidence.TELEGRAM_AGENT_CODEX_SOCKET) {
     const socketTimestamp = 170000000000001000n + BigInt(scenario.codexIdentity);
     return Promise.resolve({ stdout: ['170000000000000000', socketTimestamp, '0000000000000123'].join('\r\n') });
@@ -240,6 +254,13 @@ globalThis.fetch = async (url, options) => {
       result = true;
       break;
     case 'getUpdates':
+      if (scenario.holdPoll) {
+        await new Promise((resolve) => {
+          if (options.signal.aborted) resolve();
+          else options.signal.addEventListener('abort', resolve, { once: true });
+        });
+        throw options.signal.reason;
+      }
       if (++polls === 1) {
         if (scenario.codexChoice) {
           let deadline;

@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
+import { fileURLToPath } from 'node:url';
 import { isDeepStrictEqual } from 'node:util';
 import { openButtonState } from './button-state.mjs';
 import { openAppServer } from './codex.mjs';
@@ -7,6 +8,7 @@ import { codexChoices } from './codex-choices.mjs';
 import { openCodeForms } from './opencode-forms.mjs';
 import { codexPermission, openCodePermissionDescription, permissions } from './permissions.mjs';
 import { readProfile } from './profile.mjs';
+import { receiverCli, codexId, openCodeId } from './receiver-cli.mjs';
 import { openTextState } from './text-state.mjs';
 import { isOwnerCallback, isOwnerMessage, telegramClient, TelegramError } from './telegram.mjs';
 
@@ -50,7 +52,7 @@ function* withHeader(header, text) {
   }
 }
 
-async function runReceiver(telegram, profile, textState, buttonState, threadIds, openCodeIds, stopSignal) {
+async function runReceiver(telegram, profile, textState, buttonState, threadIds, openCodeIds, stopSignal, reportAvailability, pauseOnConflict) {
   const sessions = new Map();
   const drafts = new Map();
   const codexKeys = new Set([...threadIds].map((id) => 'Codex:' + id));
@@ -80,6 +82,21 @@ async function runReceiver(telegram, profile, textState, buttonState, threadIds,
   let codex;
   let codexInterrupted = false;
   let codexPublicationPending = false;
+  let reportedAvailability;
+  let reporting = Promise.resolve();
+  function updateAvailability() {
+    const write = reporting.then(async () => {
+      const availability = {
+        Codex: !threadIds.size ? 'не настроен' : codex && [...codexKeys].some((key) => sessions.has(key)) ? 'доступен' : 'недоступен',
+        OpenCode: !openCodeIds.size ? 'не настроен' : openCode ? 'доступен' : 'недоступен',
+      };
+      if (isDeepStrictEqual(availability, reportedAvailability)) return;
+      await reportAvailability(availability);
+      reportedAvailability = availability;
+    });
+    reporting = write.catch(() => {});
+    return write;
+  }
   function onCodexEvent(method, event, requestId) {
     const key = `Codex:${event?.threadId}`;
     if (method === 'serverRequest/resolved') {
@@ -95,6 +112,7 @@ async function runReceiver(telegram, profile, textState, buttonState, threadIds,
       sessions.delete(key);
       choices.clearThread(session.id);
       approvals.clear('Codex', session.id);
+      if (reportedAvailability) void updateAvailability().catch(() => {});
       return;
     }
     if (method === 'turn/completed') {
@@ -149,6 +167,7 @@ async function runReceiver(telegram, profile, textState, buttonState, threadIds,
     for (const [key, session] of sessions) {
       if (session.agent === 'Codex') sessions.delete(key);
     }
+    if (reportedAvailability) void updateAvailability().catch(() => {});
   }
 
   function suspendCodexButtons() {
@@ -185,6 +204,7 @@ async function runReceiver(telegram, profile, textState, buttonState, threadIds,
     for (const [key, session] of sessions) {
       if (session.agent === 'OpenCode') sessions.delete(key);
     }
+    if (reportedAvailability) void updateAvailability().catch(() => {});
   }
 
   function suspendOpenCodeButtons() {
@@ -592,6 +612,7 @@ async function runReceiver(telegram, profile, textState, buttonState, threadIds,
       return 1;
     }
 
+    await updateAvailability();
     console.log('Приём Telegram запущен.');
     let offset;
     let retryDelay = 500;
@@ -602,6 +623,10 @@ async function runReceiver(telegram, profile, textState, buttonState, threadIds,
         retryDelay = 500;
       } catch (error) {
         if (stopSignal.aborted) return 0;
+        if (error instanceof TelegramError && error.code === 409) {
+          await pauseOnConflict();
+          return 1;
+        }
         if (!(error instanceof TelegramError)
           || (error.code !== undefined && error.code !== 429 && error.code < 500)) throw error;
         suspendCodexButtons();
@@ -612,6 +637,7 @@ async function runReceiver(telegram, profile, textState, buttonState, threadIds,
       }
       if (!Array.isArray(updates)) throw new TelegramError();
       await recoverButtons();
+      await updateAvailability();
       for (const update of updates) {
         if (stopSignal.aborted) return 0;
         if (!Number.isSafeInteger(update?.update_id) || update.update_id < 0 || update.update_id < offset) continue;
@@ -648,29 +674,18 @@ async function runReceiver(telegram, profile, textState, buttonState, threadIds,
   } finally {
     codex?.close();
     await openCode?.close();
+    await reporting;
   }
 }
 
-async function main(args) {
-  const [command, ...ids] = args;
-  const codexId = /^[\da-f]{8}(?:-[\da-f]{4}){3}-[\da-f]{12}$/i;
-  const openCodeId = /^opencode:ses_[a-zA-Z\d_-]{1,124}$/;
-  if (command !== 'start' || !ids.length || ids.some((id) => !codexId.test(id) && !openCodeId.test(id))) {
-    console.error('Запуск: node src/receiver.mjs start <идентификатор-сессии-Codex|opencode:идентификатор> [...]');
-    return 1;
-  }
-
+async function receive(directory, control, ids, stop) {
   let profile;
   try {
-    profile = await readProfile();
+    profile = await readProfile(directory);
   } catch {
     console.error('Приём выключен. Проверьте файлы и права доступа профиля ~/.telegram вне Git.');
     return 1;
   }
-  const stop = new AbortController();
-  const abort = () => stop.abort();
-  process.on('SIGINT', abort);
-  process.on('SIGTERM', abort);
   try {
     const telegram = telegramClient(profile, stop.signal);
     if (!await telegram.verifyIdentity()) {
@@ -688,18 +703,24 @@ async function main(args) {
     }
     const threadIds = new Set(ids.filter((id) => codexId.test(id)).map((id) => id.toLowerCase()));
     const openCodeIds = new Set(ids.filter((id) => openCodeId.test(id)).map((id) => id.slice('opencode:'.length)));
-    return await runReceiver(telegram, profile, textState, buttonState, threadIds, openCodeIds, stop.signal);
+    const pauseOnConflict = async () => {
+      if (await control.setPause('conflict')) {
+        // The pause stops polling immediately. The independent outgoing request gets its own timeout.
+        const outgoing = telegramClient(profile, new AbortController().signal);
+        await outgoing.send('Приём Telegram приостановлен. Конфликт получателей (409). Устраните конфликт и запустите приём на компьютере.')
+          .catch(() => console.error('Telegram не подтвердил отправку уведомления о конфликте.'));
+      }
+      console.error('Приём выключен. Конфликт получателей Telegram (409).');
+    };
+    return await runReceiver(telegram, profile, textState, buttonState, threadIds, openCodeIds, stop.signal, control.availability, pauseOnConflict);
   } catch (error) {
     if (stop.signal.aborted) return 0;
     const reason = error instanceof TelegramError
-      ? (error.code === 409 ? 'Конфликт получателей Telegram.' : 'Ошибка связи с Telegram.')
+      ? 'Ошибка связи с Telegram.'
       : (error?.code ? 'Ошибка доступа к локальному состоянию.' : 'Ошибка связи с общим App Server Codex.');
     console.error(`Приём выключен. ${reason}`);
     return 1;
-  } finally {
-    process.off('SIGINT', abort);
-    process.off('SIGTERM', abort);
   }
 }
 
-process.exitCode = await main(process.argv.slice(2));
+process.exitCode = await receiverCli(process.argv.slice(2), fileURLToPath(import.meta.url), receive);

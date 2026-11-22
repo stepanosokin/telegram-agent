@@ -6,6 +6,7 @@ import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
+import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 
 const primaryThread = '01900000-0000-7000-8000-000000000001';
@@ -28,7 +29,7 @@ function newText(text, messageId = 30, updateId = 10) {
   return reply({ text, message_id: messageId, reply_to_message: undefined }, updateId);
 }
 
-async function run(scenario, threads = [primaryThread], restart) {
+async function run(scenario, threads = [primaryThread], restart, inspect) {
   const home = await mkdtemp(join(tmpdir(), 'telegram-agent-test-'));
   const profile = join(home, '.telegram');
   let codexSocket;
@@ -108,7 +109,8 @@ exit $LASTEXITCODE
     }
     await registerOpenCode(scenario.openCode);
     await registerCodex(scenario.codexIdentity);
-    const first = await runReceiver(scenario, threads, home, openCodeState);
+    const first = scenario.skipStart ? undefined : await runReceiver(scenario, threads, home, openCodeState);
+    if (inspect) return await inspect(first, home);
     if (scenario.inspectRecovery) {
       const directory = join(profile, 'receiver-text-v1-100-200-300');
       const names = await readdir(directory);
@@ -127,8 +129,8 @@ exit $LASTEXITCODE
   }
 }
 
-async function runReceiver(scenario, threads, home, openCodeState) {
-  const child = fork(receiver, ['start', ...threads], {
+function launchReceiver(scenario, args, home, openCodeState = join(home, 'state')) {
+  const child = fork(receiver, args, {
     execArgv: ['--import', setup.href],
     env: {
       ...process.env,
@@ -141,21 +143,177 @@ async function runReceiver(scenario, threads, home, openCodeState) {
     silent: true,
   });
   const calls = [];
+  const { promise: polling, resolve: reportPoll } = Promise.withResolvers();
+  let stdout = '';
   let stderr = '';
-  child.on('message', (call) => calls.push(call));
+  child.on('message', (call) => {
+    calls.push(call);
+    if (call.channel === 'telegram' && call.method === 'getUpdates') reportPoll();
+  });
+  child.stdout.setEncoding('utf8').on('data', (text) => stdout += text);
   child.stderr.setEncoding('utf8').on('data', (text) => stderr += text);
-  const deadline = setTimeout(() => child.kill(), 15_000);
-  try {
-    const [code] = await once(child, 'close');
-    return { calls, code, stderr };
-  } finally {
-    clearTimeout(deadline);
-  }
+  const deadline = setTimeout(() => child.kill(), 60_000);
+  const done = once(child, 'close').then(([code]) => ({ calls, code, stdout, stderr })).finally(() => clearTimeout(deadline));
+  return { child, calls, polling, done };
+}
+
+function runReceiver(scenario, threads, home, openCodeState) {
+  return launchReceiver(scenario, ['start', ...threads], home, openCodeState).done;
 }
 
 function callsFor(result, channel, method) {
-  return result.calls.filter((call) => call.channel === channel && call.method === method);
+  return result.calls.filter((call) => call.channel === channel && call.method === method
+    && !(method === 'sendMessage' && call.params.text.startsWith('Приём Telegram приостановлен.')));
 }
+
+async function receiverCommand(home, ...args) {
+  return promisify(execFile)(process.execPath, [fileURLToPath(receiver), ...args], {
+    env: { ...process.env, HOME: home, USERPROFILE: home },
+    windowsHide: true,
+    timeout: 15_000,
+  });
+}
+
+test('a Telegram 409 pauses the receiver and alerts the private chat once', async () => {
+  await run({}, [primaryThread], undefined, async (result, home) => {
+    const notifications = result.calls.filter(({ channel, method, params }) => channel === 'telegram'
+      && method === 'sendMessage' && params.text.startsWith('Приём Telegram приостановлен.'));
+    assert.equal(notifications.length, 1);
+    assert.equal(notifications[0].params.chat_id, 200);
+    assert.match(notifications[0].params.text, /409/);
+    const { stdout } = await receiverCommand(home, 'status');
+    assert.match(stdout, /приём.*пауза/i);
+    assert.match(stdout, /конфликт.*409/i);
+  });
+});
+
+test('autostart is opt-in and cannot clear a conflict pause', async () => {
+  await run({}, [primaryThread], undefined, async (result, home) => {
+    const scenario = { scheduler: true };
+    assert.match((await receiverCommand(home, 'status')).stdout, /автозапуск.*выключен/i);
+    const disabled = await launchReceiver(scenario, ['auto-run'], home).done;
+    assert.equal(disabled.code, 0);
+    assert.equal(disabled.calls.length, 0);
+    const enabled = await launchReceiver(scenario, ['autostart', 'enable', primaryThread], home).done;
+    assert.equal(enabled.code, 0, enabled.stderr);
+    assert.equal(enabled.calls.filter((call) => call.channel === 'scheduler').length, 1);
+    assert.match((await receiverCommand(home, 'status')).stdout, /автозапуск.*включён/i);
+    const resumed = launchReceiver(scenario, ['auto-run'], home);
+    try {
+      if (process.platform === 'win32') await resumed.done;
+      else await once(resumed.child, 'message');
+      assert.equal(resumed.calls.filter(({ channel }) => channel === 'telegram').length, 0);
+    } finally {
+      const disabledAgain = await launchReceiver(scenario, ['autostart', 'disable'], home).done;
+      assert.equal(disabledAgain.code, 0, disabledAgain.stderr);
+      await resumed.done;
+    }
+    assert.equal(result.calls.filter(({ method }) => method === 'getUpdates').length, 2);
+  });
+});
+
+async function waitForPoll(active) {
+  await Promise.race([active.polling, active.done.then((result) => {
+    assert.fail(`Получатель завершился до первого getUpdates: ${result.stderr || result.code}`);
+  })]);
+}
+
+test('scheduled and manual receivers share one lock, and only an explicit start clears the pause', async () => {
+  await run({ skipStart: true }, [primaryThread], undefined, async (_, home) => {
+    const scenario = { scheduler: true, holdPoll: true };
+    const enabled = await launchReceiver(scenario, ['autostart', 'enable', primaryThread], home).done;
+    assert.equal(enabled.code, 0, enabled.stderr);
+    if (process.platform === 'linux') await writeFile(join(home, 'login-state'), 'fixture-session');
+    const active = launchReceiver(scenario, ['auto-run'], home);
+    try {
+      await waitForPoll(active);
+      const status = await receiverCommand(home, 'status');
+      assert.match(status.stdout, /приём.*запущен/i);
+      assert.match(status.stdout, /Codex: доступен/);
+      assert.match(status.stdout, /OpenCode: не настроен/);
+      const enabledAgain = await launchReceiver(scenario, ['autostart', 'enable', primaryThread], home).done;
+      assert.equal(enabledAgain.code, 0, enabledAgain.stderr);
+      assert.match((await receiverCommand(home, 'status')).stdout, /приём.*запущен/i);
+      assert.equal(enabledAgain.calls.filter(({ channel }) => channel === 'scheduler').length, 0);
+      const second = await launchReceiver({}, ['start', primaryThread], home).done;
+      assert.equal(second.code, 1);
+      assert.match(second.stderr, /уже запущен/i);
+      assert.equal(second.calls.length, 0);
+
+      assert.match((await receiverCommand(home, 'stop')).stdout, /остановлен/i);
+      const paused = await receiverCommand(home, 'status');
+      assert.match(paused.stdout, /ручная остановка/i);
+      assert.doesNotMatch(paused.stdout, /завершает работу/i);
+      assert.equal(active.calls.filter(({ method }) => method === 'getUpdates').length, 1);
+      const resumed = launchReceiver({ holdPoll: true }, ['start', primaryThread], home);
+      try {
+        await waitForPoll(resumed);
+        assert.match((await receiverCommand(home, 'status')).stdout, /приём.*запущен/i);
+      } finally {
+        await receiverCommand(home, 'stop');
+        assert.equal((await resumed.done).code, 0);
+      }
+    } finally {
+      const disabled = await launchReceiver(scenario, ['autostart', 'disable'], home).done;
+      assert.equal(disabled.code, 0, disabled.stderr);
+      assert.equal((await active.done).code, 0);
+    }
+  });
+});
+
+test('a lingering Linux user service follows logind and respects a pause on the next login', { skip: process.platform !== 'linux' }, async () => {
+  await run({ skipStart: true }, [primaryThread], undefined, async (_, home) => {
+    const scenario = { scheduler: true, holdPoll: true };
+    assert.equal((await launchReceiver(scenario, ['autostart', 'enable', primaryThread], home).done).code, 0);
+    const service = launchReceiver(scenario, ['auto-run'], home);
+    const login = join(home, 'login-state');
+    try {
+      const [call] = await once(service.child, 'message');
+      assert.equal(call.channel, 'login');
+      assert.match((await receiverCommand(home, 'status')).stdout, /приём.*выключен/i);
+      assert.equal(service.calls.filter(({ channel }) => channel === 'telegram').length, 0);
+      await writeFile(login, 'fixture-session');
+      await waitForPoll(service);
+      assert.match((await receiverCommand(home, 'status')).stdout, /приём.*запущен/i);
+      await unlink(login);
+      let status;
+      for (let attempt = 0; attempt < 50; attempt++) {
+        status = (await receiverCommand(home, 'status')).stdout;
+        if (/приём telegram: выключен/i.test(status)) break;
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+      assert.match(status, /приём telegram: выключен/i);
+      assert.match(status, /автозапуск: включён/i);
+      await receiverCommand(home, 'stop');
+      await writeFile(login, 'next-fixture-session');
+      let currentLogin;
+      do { [currentLogin] = await once(service.child, 'message'); }
+      while (currentLogin.channel !== 'login' || currentLogin.method !== 'show-session');
+      assert.match((await receiverCommand(home, 'status')).stdout, /ручная остановка/i);
+      assert.equal(service.calls.filter(({ method }) => method === 'getUpdates').length, 1);
+    } finally {
+      await launchReceiver(scenario, ['autostart', 'disable'], home).done;
+      await service.done;
+    }
+  });
+});
+
+test('a crashed receiver releases its lock without opening a paused receiver', async () => {
+  await run({ skipStart: true }, [primaryThread], undefined, async (_, home) => {
+    const active = launchReceiver({ holdPoll: true }, ['start', primaryThread], home);
+    try {
+      await waitForPoll(active);
+      active.child.kill('SIGKILL');
+      await active.done;
+      const { stdout } = await receiverCommand(home, 'stop');
+      assert.match(stdout, /остановлен/i);
+      assert.match((await receiverCommand(home, 'status')).stdout, /ручная остановка/i);
+    } finally {
+      active.child.kill('SIGKILL');
+      await active.done;
+    }
+  });
+});
 
 const harmlessChoice = {
   method: 'item/tool/requestUserInput',
