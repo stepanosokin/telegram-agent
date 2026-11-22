@@ -23,11 +23,13 @@ let rpcCount = 0;
 let polls = 0;
 let sentCount = 0;
 const prompts = [];
+const { promise: codexChoicePublished, resolve: recordCodexChoice } = Promise.withResolvers();
 const { promise: openCodePublished, resolve: recordOpenCodePublish } = Promise.withResolvers();
 let openCodePosts = 0;
 let openCodeStream;
 let openCodeProbes = 0;
 let openCodeResumePublished;
+let emitCodexPacket;
 const openCodeEncoder = new TextEncoder();
 
 function sendOpenCodeText(id, text) {
@@ -106,17 +108,21 @@ globalThis.fetch = async (url, options) => {
         return new Response(JSON.stringify({ ok: false, error_code: 503 }), { status: 503 });
       }
       result = { message_id: ++sentCount, chat: telegram.chat };
+      if (scenario.codexChoice && !params.reply_parameters && params.text.startsWith('Codex ·')) recordCodexChoice();
       if (params.text.startsWith('OpenCode ·')) {
         openCodePosts++;
         recordOpenCodePublish();
         if (openCodePosts > 1) openCodeResumePublished?.();
       }
       if (params.reply_markup?.inline_keyboard.length) {
-        const original = scenario.updates.find(({ message }) => message?.message_id === params.reply_parameters.message_id);
+        const original = scenario.updates?.find(({ message }) => message?.message_id === params.reply_parameters?.message_id);
         prompts.push({
           message: { ...result, date: 1, from: telegram.bot, reply_to_message: original?.message },
           choices: params.reply_markup.inline_keyboard.flat(),
         });
+        if (scenario.delayedChoicePublication && !params.reply_parameters) {
+          await new Promise((resolve) => setTimeout(resolve, 100));
+        }
       }
       break;
     case 'answerCallbackQuery':
@@ -125,6 +131,11 @@ globalThis.fetch = async (url, options) => {
       break;
     case 'getUpdates':
       if (++polls === 1) {
+        if (scenario.codexChoice) {
+          let deadline;
+          await Promise.race([codexChoicePublished, new Promise((resolve) => { deadline = setTimeout(resolve, 1000); })]);
+          clearTimeout(deadline);
+        }
         if (scenario.openCode?.text) {
           await openCodePublished;
         }
@@ -136,6 +147,7 @@ globalThis.fetch = async (url, options) => {
         await promise;
         result = [scenario.openCode.resumedReply];
       } else if (polls === 2 && scenario.callbacks) {
+        if (scenario.beforeChoice) emitCodexPacket(scenario.beforeChoice);
         result = scenario.callbacks.map(({ prompt, choice, tokenFrom = prompt, messageOverrides, ...overrides }, index) => ({
           update_id: 100 + index,
           callback_query: {
@@ -167,8 +179,28 @@ childProcess.spawn = (command, args, options) => {
     },
   });
   const emit = (packet) => proxy.stdout.write(JSON.stringify(packet) + '\n');
+  emitCodexPacket = emit;
+  if (scenario.failChoiceWrite) {
+    const originalWrite = proxy.stdin._write.bind(proxy.stdin);
+    proxy.stdin._write = (chunk, encoding, callback) => {
+      const packet = JSON.parse(chunk);
+      if (!packet.method && packet.result) {
+        emit({ method: 'serverRequest/resolved', params: { threadId: scenario.codexChoice.params.threadId, requestId: packet.id } });
+        queueMicrotask(() => callback(new Error('fixture write failure')));
+        return;
+      }
+      originalWrite(chunk, encoding, callback);
+    };
+  }
   proxy.stdin.on('data', (line) => {
-    const { method, id, params } = JSON.parse(line);
+    const { method, id, params, result: clientResult } = JSON.parse(line);
+    if (!method && clientResult && scenario.codexChoice) {
+      record('codex', 'serverResponse', { id, result: clientResult });
+      if (!scenario.noChoiceResolution) {
+        emit({ method: 'serverRequest/resolved', params: { threadId: scenario.codexChoice.params.threadId, requestId: id } });
+      }
+      return;
+    }
     record('codex', method, params);
     const threadId = params?.threadId;
     const session = sessions[threadId];
@@ -187,6 +219,7 @@ childProcess.spawn = (command, args, options) => {
         result = { thread: { id: threadId, ...session } };
         break;
       case 'thread/turns/list':
+        if (scenario.closeWhileChecking && polls >= 2) emit(scenario.closeWhileChecking);
         result = { data: session?.turns || [] };
         break;
       case 'thread/resume':
@@ -234,6 +267,9 @@ childProcess.spawn = (command, args, options) => {
         throw new Error('Unexpected App Server method: ' + method);
     }
     emit({ id, result });
+    if (method === 'thread/resume' && scenario.codexChoice?.params.threadId === threadId) {
+      emit(scenario.codexChoice);
+    }
     if (method === 'thread/resume' && session && !scenario.noNewItem && !scenario.withoutItem?.includes(threadId)) {
       const index = threadIds.indexOf(threadId) + 1;
       emit({

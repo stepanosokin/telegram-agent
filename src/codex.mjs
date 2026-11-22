@@ -10,7 +10,7 @@ class AppServerRejection extends Error {
   }
 }
 
-export function openAppServer(onEvent) {
+export function openAppServer(onEvent, onDisconnect) {
   const proxy = spawn('codex', ['app-server', 'proxy'], {
     stdio: ['pipe', 'pipe', 'ignore'],
     windowsHide: true,
@@ -29,6 +29,7 @@ export function openAppServer(onEvent) {
     pending.clear();
     lines.close();
     proxy.kill();
+    onDisconnect();
   }
 
   proxy.on('error', close);
@@ -53,7 +54,11 @@ export function openAppServer(onEvent) {
       onEvent(message.method, message.params);
       return;
     }
-    // Requests from the server are handled in the original interface.
+    if (message?.method === 'item/tool/requestUserInput'
+      && (typeof message.id === 'string' || Number.isSafeInteger(message.id))) {
+      onEvent(message.method, message.params, message.id);
+      return;
+    }
     if (message?.method || !pending.has(message?.id)) return;
     const request = pending.get(message.id);
     if (message.error) request.reject(new AppServerRejection(message.error.code));
@@ -108,6 +113,12 @@ export function openAppServer(onEvent) {
     }
   }
 
+  async function activeTurnId(threadId) {
+    const turns = await call('thread/turns/list', { threadId, limit: 1, sortDirection: 'desc', itemsView: 'notLoaded' });
+    const [activeTurn] = Array.isArray(turns?.data) ? turns.data : [];
+    if (activeTurn?.status === 'inProgress' && typeof activeTurn.id === 'string' && activeTurn.id) return activeTurn.id;
+  }
+
   return {
     async initialize() {
       await call('initialize', {
@@ -137,19 +148,22 @@ export function openAppServer(onEvent) {
       const response = await call('thread/resume', { threadId, excludeTurns: true });
       return response?.thread;
     },
+    activeTurnId,
+    respond(id, result) {
+      return new Promise((resolve, reject) => {
+        if (closed) throw disconnected;
+        proxy.stdin.write(JSON.stringify({ id, result }) + '\n', (error) => {
+          if (error) reject(disconnected);
+          else resolve(undefined);
+        });
+      });
+    },
     async deliver(thread, text) {
       const threadId = thread.id;
       const input = [{ type: 'text', text, text_elements: [] }];
       if (thread.status.type === 'active') {
-        let turns;
-        try {
-          turns = await call('thread/turns/list', { threadId, limit: 1, sortDirection: 'desc', itemsView: 'notLoaded' });
-        } catch {
-          return 'unavailable';
-        }
-        const [activeTurn] = Array.isArray(turns?.data) ? turns.data : [];
-        const expectedTurnId = activeTurn?.status === 'inProgress' && activeTurn.id;
-        if (typeof expectedTurnId !== 'string' || !expectedTurnId) return 'unavailable';
+        const expectedTurnId = await activeTurnId(threadId).catch(() => undefined);
+        if (!expectedTurnId) return 'unavailable';
         try {
           const response = await call('turn/steer', { threadId, expectedTurnId, input });
           return response?.turnId === expectedTurnId ? 'delivered' : 'unknown';

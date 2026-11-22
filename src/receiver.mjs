@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { openAppServer } from './codex.mjs';
+import { codexChoices } from './codex-choices.mjs';
 import { readProfile } from './profile.mjs';
 import { isOwnerCallback, isOwnerMessage, telegramClient, TelegramError } from './telegram.mjs';
 
@@ -42,6 +43,7 @@ async function runReceiver(telegram, profile, threadIds, openCodeIds, stopSignal
   const drafts = new Map();
   const defaultAgent = !openCodeIds.size ? 'Codex' : !threadIds.size ? 'OpenCode' : undefined;
   let outgoing = Promise.resolve();
+  const choices = codexChoices(telegram, (session) => sessionLabel(session, 160));
 
   async function publish(session, body) {
     if (!body.trim()) return;
@@ -54,13 +56,23 @@ async function runReceiver(telegram, profile, threadIds, openCodeIds, stopSignal
     }
   }
 
-  const codex = threadIds.size ? openAppServer((method, event) => {
+  const codex = threadIds.size ? openAppServer((method, event, requestId) => {
+    if (method === 'serverRequest/resolved') void choices.resolve(event?.threadId, event?.requestId);
     const key = `Codex:${event?.threadId}`;
     const session = sessions.get(key);
     if (!session) return;
     if (method === 'thread/closed' || method === 'thread/archived' || method === 'thread/deleted'
       || (method === 'thread/status/changed' && event.status?.type === 'notLoaded')) {
       sessions.delete(key);
+      choices.clearThread(session.id);
+      return;
+    }
+    if (method === 'turn/completed') choices.finishTurn(session.id, event.turn?.id);
+    if (method === 'turn/started') choices.startTurn(session.id, event.turn?.id);
+    if (requestId !== undefined) {
+      void choices.publish(session, requestId, event, confirmCodexTurn)
+        .catch(() => console.error('Не удалось опубликовать запрос выбора Codex в Telegram.'));
+      return;
     }
     if (method === 'thread/name/updated' && typeof event.threadName === 'string') {
       session.name = event.threadName;
@@ -73,7 +85,19 @@ async function runReceiver(telegram, profile, threadIds, openCodeIds, stopSignal
       session.confirmed = true;
       await publish(session, event.item.text);
     }).catch(() => console.error('Не удалось опубликовать сообщение Codex в Telegram.'));
-  }) : undefined;
+  }, () => choices.clearThread(undefined)) : undefined;
+
+  async function confirmCodexTurn(session, turnId) {
+    try {
+      // A replay on subscription supplies the current request, but the turn also needs to be live.
+      await Promise.resolve();
+      if (!await session.ready || !await codex.isLoaded(session.id)) return false;
+      return await codex.activeTurnId(session.id) === turnId
+        && !stopSignal.aborted && sessions.get(session.key) === session;
+    } catch {
+      return false;
+    }
+  }
 
   let openCode;
   let openCodeReady;
@@ -170,7 +194,6 @@ async function runReceiver(telegram, profile, threadIds, openCodeIds, stopSignal
   }
 
   async function chooseSession(query) {
-    if (!isOwnerCallback(query, profile)) return;
     const promptId = query.message.message_id;
     const draft = drafts.get(promptId);
     const session = draft?.choices.get(query.data);
@@ -265,6 +288,8 @@ async function runReceiver(telegram, profile, threadIds, openCodeIds, stopSignal
         if (!Number.isSafeInteger(update?.update_id) || update.update_id < 0 || update.update_id < offset) continue;
         offset = update.update_id + 1;
         if (update.callback_query) {
+          if (!isOwnerCallback(update.callback_query, profile)) continue;
+          if (await choices.handle(update.callback_query, confirmCodexTurn, (id, result) => codex.respond(id, result))) continue;
           await chooseSession(update.callback_query);
           continue;
         }

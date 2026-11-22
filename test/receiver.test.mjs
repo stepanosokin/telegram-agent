@@ -104,6 +104,155 @@ function callsFor(result, channel, method) {
   return result.calls.filter((call) => call.channel === channel && call.method === method);
 }
 
+const harmlessChoice = {
+  method: 'item/tool/requestUserInput',
+  id: 1,
+  params: {
+    threadId: primaryThread, turnId: 'asking-turn', itemId: 'question-item',
+    isBlocking: true, autoResolutionMs: null,
+    questions: [{
+      id: 'color', header: 'Цвет', question: 'Какой цвет выбрать?', isOther: false, isSecret: false,
+      options: [
+        { label: 'Синий', description: 'Цвет неба' },
+        { label: 'Зелёный', description: 'Цвет листвы' },
+      ],
+    }],
+  },
+};
+
+const askingSession = {
+  [primaryThread]: { name: 'Первый диалог', status: { type: 'active' }, turns: [{ id: 'asking-turn', status: 'inProgress' }] },
+};
+
+test('публикует варианты Codex и отвечает в тот же открытый запрос кнопкой', async () => {
+  const result = await run({ codexChoice: harmlessChoice, sessions: askingSession, noNewItem: true, callbacks: [{ prompt: 0, choice: 1 }] });
+  const [prompt] = callsFor(result, 'telegram', 'sendMessage');
+  assert.match(prompt?.params.text, /Codex.*Первый диалог[\s\S]*Какой цвет выбрать\?[\s\S]*Цвет листвы/);
+  assert.deepEqual(prompt.params.reply_markup.inline_keyboard.flat().map(({ text }) => text), ['Синий', 'Зелёный']);
+  assert.deepEqual(callsFor(result, 'codex', 'serverResponse').map(({ params }) => params), [
+    { id: 1, result: { answers: { color: { answers: ['Зелёный'] } } } },
+  ]);
+  const [edit] = callsFor(result, 'telegram', 'editMessageText');
+  assert.equal(edit.params.message_id, 1);
+  assert.match(edit.params.text, /Зелёный/);
+  assert.deepEqual(edit.params.reply_markup.inline_keyboard, []);
+});
+
+test('сохраняет только одну отправку выбора Codex и показывает известный статус повторной кнопке', async () => {
+  const result = await run({
+    codexChoice: harmlessChoice, sessions: askingSession, noNewItem: true,
+    callbacks: [{ prompt: 0, choice: 0 }, { prompt: 0, choice: 1 }],
+  });
+  assert.equal(callsFor(result, 'codex', 'serverResponse').length, 1);
+  assert.match(callsFor(result, 'telegram', 'answerCallbackQuery').at(-1).params.text, /отправлен.*закрыт/i);
+});
+
+test('при неподтверждённой отправке выбора не повторяет отправку и направляет к исходной сессии', async () => {
+  const result = await run({
+    codexChoice: harmlessChoice, sessions: askingSession, noNewItem: true, noChoiceResolution: true,
+    callbacks: [{ prompt: 0, choice: 0 }, { prompt: 0, choice: 1 }],
+  });
+  assert.equal(callsFor(result, 'codex', 'serverResponse').length, 1);
+  assert.match(callsFor(result, 'telegram', 'answerCallbackQuery').at(-1).params.text, /не подтверждена.*на компьютере/i);
+});
+
+test('не подтверждает свой ответ, когда Codex закрыл запрос, а запись ответа завершилась ошибкой', async () => {
+  const result = await run({
+    codexChoice: harmlessChoice, sessions: askingSession, noNewItem: true, failChoiceWrite: true,
+    callbacks: [{ prompt: 0, choice: 1 }],
+  });
+  assert.equal(callsFor(result, 'codex', 'serverResponse').length, 0);
+  const [edit] = callsFor(result, 'telegram', 'editMessageText');
+  assert.match(edit?.params.text, /Доставка ответа не подтверждена/);
+});
+
+test('отклоняет выбор Codex от чужого автора, другого чата и другого сообщения бота', async () => {
+  const result = await run({
+    codexChoice: harmlessChoice, sessions: askingSession, noNewItem: true, updates: [newText('Текст для сессии')],
+    callbacks: [
+      { prompt: 0, choice: 0, from: { id: 999, is_bot: false } },
+      { prompt: 0, choice: 1, messageOverrides: { chat: { id: 200, type: 'group' } } },
+      { prompt: 0, choice: 1, messageOverrides: { message_id: 2 } },
+    ],
+  });
+  assert.equal(callsFor(result, 'codex', 'serverResponse').length, 0);
+  const answers = callsFor(result, 'telegram', 'answerCallbackQuery');
+  assert.equal(answers.length, 1);
+  assert.match(answers[0].params.text, /недоступен/);
+});
+
+test('не отвечает, когда Codex закрыл запрос с компьютера до нажатия', async () => {
+  const result = await run({
+    codexChoice: harmlessChoice, sessions: askingSession, noNewItem: true,
+    beforeChoice: { method: 'serverRequest/resolved', params: { threadId: primaryThread, requestId: 1 } },
+    callbacks: [{ prompt: 0, choice: 0 }],
+  });
+  assert.equal(callsFor(result, 'codex', 'serverResponse').length, 0);
+  assert.match(callsFor(result, 'telegram', 'answerCallbackQuery')[0].params.text, /исходную сессию на компьютере/);
+  assert.deepEqual(callsFor(result, 'telegram', 'editMessageText')[0].params.reply_markup.inline_keyboard, []);
+});
+
+test('не отвечает, если запрос закрыли во время сверки активного хода Codex', async () => {
+  const result = await run({
+    codexChoice: harmlessChoice, sessions: askingSession, noNewItem: true,
+    closeWhileChecking: { method: 'serverRequest/resolved', params: { threadId: primaryThread, requestId: 1 } },
+    callbacks: [{ prompt: 0, choice: 0 }],
+  });
+  assert.equal(callsFor(result, 'codex', 'serverResponse').length, 0);
+  assert.match(callsFor(result, 'telegram', 'answerCallbackQuery')[0].params.text, /исходную сессию на компьютере/);
+});
+
+test('проверяет привязку клика, полученного до возврата ID опубликованного сообщения', async () => {
+  const result = await run({
+    codexChoice: harmlessChoice, sessions: askingSession, noNewItem: true, delayedChoicePublication: true,
+    callbacks: [{ prompt: 0, choice: 0 }],
+  });
+  assert.equal(callsFor(result, 'codex', 'serverResponse').length, 1);
+  assert.equal(callsFor(result, 'telegram', 'editMessageText')[0].params.message_id, 1);
+});
+
+test('оставляет резервное разрешение MCP в исходной сессии Codex', async () => {
+  const approval = structuredClone(harmlessChoice);
+  approval.params.questions[0] = {
+    id: 'mcp_tool_call_approval_1', header: 'Approve app tool call?', question: 'Allow this tool?',
+    isSecret: false, isOther: false,
+    options: [{ label: 'Allow for this session', description: 'Persist the permission' }],
+  };
+  const result = await run({ codexChoice: approval, sessions: askingSession, noNewItem: true });
+  const [prompt] = callsFor(result, 'telegram', 'sendMessage');
+  assert.match(prompt?.params.text, /нужен ответ на компьютере/);
+  assert.equal(prompt.params.reply_markup, undefined);
+  assert.equal(callsFor(result, 'codex', 'serverResponse').length, 0);
+});
+
+test('собирает ответ на все вопросы, сохраняя строковый ID серверного запроса', async () => {
+  const question = structuredClone(harmlessChoice);
+  question.id = 'input-42';
+  question.params.questions.push({
+    id: 'shape', header: 'Форма', question: 'Какая форма?', isSecret: false, isOther: true,
+    options: [{ label: 'Круг', description: 'Без углов' }, { label: 'Квадрат', description: 'Четыре угла' }],
+  });
+  const result = await run({
+    codexChoice: question, sessions: askingSession, noNewItem: true,
+    callbacks: [{ prompt: 0, choice: 2 }, { prompt: 0, choice: 1 }],
+  });
+  const [firstStatus] = callsFor(result, 'telegram', 'answerCallbackQuery');
+  assert.match(firstStatus.params.text, /остальные вопросы/);
+  assert.deepEqual(callsFor(result, 'codex', 'serverResponse').map(({ params }) => params), [{
+    id: 'input-42', result: { answers: { color: { answers: ['Зелёный'] }, shape: { answers: ['Круг'] } } },
+  }]);
+});
+
+test('оставляет секретный вопрос Codex на компьютере без публикации его содержимого', async () => {
+  const question = structuredClone(harmlessChoice);
+  question.params.questions[0].isSecret = true;
+  const result = await run({ codexChoice: question, sessions: askingSession, noNewItem: true });
+  const [prompt] = callsFor(result, 'telegram', 'sendMessage');
+  assert.match(prompt?.params.text, /нужен ответ на компьютере/);
+  assert.doesNotMatch(prompt.params.text, /Какой цвет|Цвет листвы/);
+  assert.equal(prompt.params.reply_markup, undefined);
+});
+
 test('публикует живой текст из OpenCode 2 и передаёт ответ в исходный диалог', async () => {
   const result = await run({
     openCode: { sessionID: openCodeSession, title: 'Диалог OpenCode', text: 'Ответ из OpenCode' },
